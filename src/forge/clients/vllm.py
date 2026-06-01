@@ -60,23 +60,12 @@ class VLLMClient:
         recommended_sampling: bool = False,
     ) -> None:
         self.base_url = base_url
-        # model_path is the canonical identity. vLLM accepts either a local
-        # directory containing safetensors + config or a HuggingFace repo id
-        # (e.g. "google/gemma-4-26B-A4B-it"). We pass it through as-is in
-        # the wire-format "model" field and as the sampling-defaults lookup
-        # key (using the path stem for directory paths so registry lookups
-        # match the existing GGUF-stem convention).
-        self.model_path = str(model_path)
-        path_obj = Path(self.model_path)
-        # If model_path is a filesystem path, use the directory name as the
-        # registry lookup key. If it's an HF repo id (no leading slash, has
-        # a "/"), use the trailing segment. Otherwise the full string.
-        if path_obj.is_absolute() or path_obj.exists():
-            self.model = path_obj.name
-        elif "/" in self.model_path:
-            self.model = self.model_path.split("/")[-1]
-        else:
-            self.model = self.model_path
+        # model_path is the canonical identity, sent verbatim in the wire
+        # "model" field. self.model is the derived registry-lookup key. Both
+        # are set together so the (model_path, model) invariant holds — see
+        # _set_model_identity. Must run before apply_sampling_defaults below,
+        # which reads self.model.
+        self._set_model_identity(model_path)
 
         # Apply per-model recommended sampling defaults. Caller's explicit
         # (non-None) kwargs win over the map field-by-field.
@@ -102,6 +91,35 @@ class VLLMClient:
     async def aclose(self) -> None:
         """Close the underlying httpx connection pool."""
         await self._http.aclose()
+
+    @staticmethod
+    def _derive_model_field(model_path: str) -> str:
+        """Derive the sampling-registry lookup key from the canonical path.
+
+        vLLM accepts either a local directory (safetensors + config) or an HF
+        repo id (e.g. "google/gemma-4-26B-A4B-it"). The lookup key uses the
+        path stem so registry lookups match the existing GGUF-stem convention:
+        a filesystem path → its directory name; an HF repo id (has "/") → its
+        trailing segment; anything else → the string unchanged.
+        """
+        path_obj = Path(model_path)
+        if path_obj.is_absolute() or path_obj.exists():
+            return path_obj.name
+        if "/" in model_path:
+            return model_path.split("/")[-1]
+        return model_path
+
+    def _set_model_identity(self, model_path: str | Path) -> None:
+        """Set both identity fields atomically from one canonical path.
+
+        ``model_path`` is the wire "model" field (sent verbatim); ``model`` is
+        the derived registry key. Used by ``__init__`` and by the proxy's
+        external-mode served-name adoption, so the ``(model_path, model)``
+        invariant holds the same way in both — instead of mutating the two
+        fields separately after served-name discovery.
+        """
+        self.model_path = str(model_path)
+        self.model = self._derive_model_field(self.model_path)
 
     # Sampling fields recognized in per-call overrides. ``seed`` is
     # accepted only as a per-call override (not an instance field).
@@ -165,8 +183,16 @@ class VLLMClient:
         messages: list[dict[str, str]],
         tools: list[ToolSpec] | None = None,
         sampling: dict[str, Any] | None = None,
+        passthrough: dict[str, Any] | None = None,
+        inbound_anthropic_body: dict[str, Any] | None = None,
+        raw_openai_tools: list[dict[str, Any]] | None = None,
     ) -> LLMResponse:
-        """Send messages via /v1/chat/completions and parse the response."""
+        """Send messages via /v1/chat/completions and parse the response.
+
+        ``passthrough`` / ``inbound_anthropic_body`` / ``raw_openai_tools`` are
+        accepted for protocol symmetry and ignored — vLLM parses tools and
+        reasoning server-side and is native-only.
+        """
         body: dict[str, Any] = {
             "model": self.model_path,
             "messages": messages,
@@ -196,15 +222,11 @@ class VLLMClient:
 
         tool_calls = message.get("tool_calls") or []
         if tool_calls:
-            reasoning = self._resolve_reasoning(message)
-            return [
-                ToolCall(
-                    tool=tc["function"]["name"],
-                    args=self._parse_tool_args(tc["function"].get("arguments", {})),
-                    reasoning=reasoning if i == 0 else None,
-                )
-                for i, tc in enumerate(tool_calls)
-            ]
+            return self._parse_tool_calls(
+                tool_calls,
+                reasoning=self._resolve_reasoning(message),
+                fallback_content=message.get("content") or "",
+            )
 
         return TextResponse(content=message.get("content") or "")
 
@@ -213,8 +235,15 @@ class VLLMClient:
         messages: list[dict[str, str]],
         tools: list[ToolSpec] | None = None,
         sampling: dict[str, Any] | None = None,
+        passthrough: dict[str, Any] | None = None,
+        inbound_anthropic_body: dict[str, Any] | None = None,
+        raw_openai_tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[StreamChunk]:
-        """Stream via SSE from /v1/chat/completions."""
+        """Stream via SSE from /v1/chat/completions.
+
+        ``passthrough`` / ``inbound_anthropic_body`` / ``raw_openai_tools``
+        accepted for protocol symmetry and ignored (see ``send``).
+        """
         body: dict[str, Any] = {
             "model": self.model_path,
             "messages": messages,
@@ -285,37 +314,75 @@ class VLLMClient:
                         type=ChunkType.TEXT_DELTA, content=content,
                     )
 
-        # Build the final response
+        # Build the final response. Reassemble the accumulated deltas into the
+        # OpenAI tool-call shape and route through the same parser as send(), so
+        # streaming and non-streaming agree on malformed-args handling: a fully
+        # accumulated but unparseable arguments string yields a retry-driving
+        # TextResponse, not an exception.
         if tool_call_parts:
-            reasoning = self._resolve_reasoning(
-                accumulated_reasoning, accumulated_content,
-            )
-            final: LLMResponse = [
-                ToolCall(
-                    tool=part["name"],
-                    args=self._parse_tool_args(part["args"]),
-                    reasoning=reasoning if i == 0 else None,
-                )
-                for i, part in enumerate(
-                    tool_call_parts[k] for k in sorted(tool_call_parts)
-                )
+            reassembled = [
+                {"function": {"name": part["name"], "arguments": part["args"]}}
+                for part in (tool_call_parts[k] for k in sorted(tool_call_parts))
             ]
+            final: LLMResponse = self._parse_tool_calls(
+                reassembled,
+                reasoning=self._resolve_reasoning(
+                    accumulated_reasoning, accumulated_content,
+                ),
+                fallback_content=accumulated_content,
+            )
         else:
             final = TextResponse(content=accumulated_content)
         yield StreamChunk(type=ChunkType.FINAL, response=final)
 
     @staticmethod
-    def _parse_tool_args(raw: Any) -> dict[str, Any]:
-        """Tool args from vLLM arrive as JSON-encoded string in the
-        OpenAI native format. Decode to dict.
+    def _parse_tool_calls(
+        tool_calls: list[dict[str, Any]],
+        reasoning: str | None,
+        fallback_content: str,
+    ) -> LLMResponse:
+        """Parse vLLM ``tool_calls`` into ``ToolCall`` objects (or TextResponse).
+
+        Mirrors ``OpenAICompatClient`` / ``LlamafileClient`` so every
+        OpenAI-shape client behaves the same. Tool-call ``arguments`` arrive as
+        a JSON string (vLLM's native format) or an already-decoded dict.
+        Forge is fail-loud on the right axis:
+
+        - **Malformed argument JSON** is NOT coerced into empty args (that would
+          let a model silently proceed with wrong arguments). We return a
+          ``TextResponse``, routing the raw output back through the inference
+          loop so the rescue/retry path can recover — matching llamafile.
+        - An **unexpected args type** (neither str nor dict) is a provider
+          contract violation, not a model mistake → ``BackendError``.
+
+        Defensive ``.get`` on ``function`` / ``name`` keeps a broken tool-call
+        entry from raising ``KeyError``. Used by both send() and send_stream()
+        for parity (the stream path reassembles deltas into this shape first).
         """
-        if isinstance(raw, dict):
-            return raw
-        if isinstance(raw, str):
-            if not raw:
-                return {}
-            return json.loads(raw)
-        raise BackendError(500, f"unexpected tool args shape: {type(raw).__name__}")
+        parsed: list[ToolCall] = []
+        for i, tc in enumerate(tool_calls):
+            fn = tc.get("function", {})
+            raw_args = fn.get("arguments", {})
+            if isinstance(raw_args, str):
+                if not raw_args:
+                    args: dict[str, Any] = {}
+                else:
+                    try:
+                        args = json.loads(raw_args)
+                    except json.JSONDecodeError:
+                        return TextResponse(content=fallback_content or raw_args)
+            elif isinstance(raw_args, dict):
+                args = raw_args
+            else:
+                raise BackendError(
+                    500, f"unexpected tool args shape: {type(raw_args).__name__}",
+                )
+            parsed.append(ToolCall(
+                tool=fn.get("name", ""),
+                args=args,
+                reasoning=reasoning if i == 0 else None,
+            ))
+        return parsed
 
     async def get_context_length(self) -> int | None:
         """Query the vLLM /v1/models endpoint for max_model_len.

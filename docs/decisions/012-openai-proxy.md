@@ -104,6 +104,52 @@ The proxy fully buffers each response from the backend before deciding what to d
 4. **Client disconnect handling** -- detect TCP drop, cancel in-flight backend request, release inference lock.
 5. **Testing** -- unit tests for extraction, integration tests with mock backend, smoke test with real llama-server.
 
+### Revision: native-first, with opt-in prompt capability
+
+The proxy is **native-first**. By default (`--backend-capability native`) it
+targets backends that speak the native OpenAI tools API (llama.cpp with a
+tool-calling chat template / `--jinja`, vLLM, Ollama, Anthropic) and forwards
+the client's request verbatim (below).
+
+Prompt-injection is available as an **explicit opt-in**
+(`--backend-capability prompt`, llama.cpp/llamafile only) for non-FC backends —
+it reuses the WorkflowRunner's prompt path (`build_tool_prompt`,
+`_downgrade_messages`, `extract_tool_call`) so there is **one** prompt
+implementation, not a proxy-specific fork. The capability is **declared once at
+construction and frozen** — there is deliberately **no `mode="auto"` runtime
+probe** (the old auto/HTTP-error fallback that mutated state mid-request was the
+root of the original tangle; it is not reintroduced). In prompt capability the
+verbatim passthrough is suppressed (`native_passthrough=False`): tools are
+serialized into the prompt, so a raw native transcript would be meaningless.
+
+History: this revision originally cut prompt mode from the proxy entirely
+("native-only"). Prompt was then re-added as the opt-in capability above —
+native-first is a cleaner story than a backwards-incompatible drop, and non-FC
+backends (e.g. llamafile) stay usable through the proxy.
+
+Rationale: the proxy is a transparent layer for an external agent that already
+speaks native FC to a native-FC backend. A traced capture showed the native
+path forwards the client's request byte-for-byte. The earlier eval regression
+(prompt-mode proxy underperforming) was a prompt-injection artifact on an
+FC-capable backend, not proxy overhead.
+
+To preserve that transparency, the proxy forwards the client's **verbatim
+OpenAI `tools` and `messages`** to the backend on the clean first attempt
+(`raw_openai_tools` / `raw_openai_messages`), bypassing the lossy
+`ToolSpec.from_json_schema` → `format_tool` round-trip that dropped schema
+detail and leaked empty tool names. The parsed `ToolSpec` list is kept only as
+forge's validation sidecar. On any forge mutation (retry / compaction / context
+warning) the proxy falls back to the folded/serialized form — see the
+`use_raw_messages` gate in `run_inference`, which mirrors the ADR-015
+`inbound_anthropic_body` drop-on-mutation logic.
+
+The synthetic `respond` tool is **opt-in** (`--inject-respond-tool`, default
+off): the proxy forwards the client's tools untouched unless asked to inject it.
+
+If a backend lacking native FC is placed behind the proxy, it degrades to
+passing the model's text through (no auto-downgrade) — **bring an FC-capable
+backend.**
+
 ### What this is NOT
 
 - **Not a model server.** Forge sits in front of one.

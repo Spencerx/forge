@@ -145,6 +145,7 @@ class OllamaClient:
         sampling: dict[str, Any] | None = None,
         passthrough: dict[str, Any] | None = None,
         inbound_anthropic_body: dict[str, Any] | None = None,
+        raw_openai_tools: list[dict[str, Any]] | None = None,
     ) -> LLMResponse:
         """Send messages via /api/chat and parse the response.
 
@@ -153,8 +154,8 @@ class OllamaClient:
         (forge proxy uses LlamafileClient for external mode). Adding
         Ollama passthrough is a follow-up.
 
-        ``inbound_anthropic_body`` accepted for protocol symmetry, ignored
-        (Ollama is OpenAI-shape only).
+        ``inbound_anthropic_body`` / ``raw_openai_tools`` accepted for protocol
+        symmetry, ignored (Ollama is OpenAI-shape only).
         """
         body: dict[str, Any] = {
             "model": self.model,
@@ -197,10 +198,14 @@ class OllamaClient:
             reasoning = self._resolve_reasoning(
                 msg.get("thinking", ""), msg.get("content", ""),
             )
+            # Ollama returns tool-call arguments already decoded as a dict
+            # (unlike vLLM/llama.cpp, which send a JSON string) — no json.loads
+            # needed. Defensive .get on function/name so a broken tool-call
+            # entry degrades to empty rather than raising KeyError.
             return [
                 ToolCall(
-                    tool=tc["function"]["name"],
-                    args=tc["function"].get("arguments", {}),
+                    tool=tc.get("function", {}).get("name", ""),
+                    args=tc.get("function", {}).get("arguments", {}),
                     reasoning=reasoning if i == 0 else None,
                 )
                 for i, tc in enumerate(tool_calls)
@@ -215,11 +220,12 @@ class OllamaClient:
         sampling: dict[str, Any] | None = None,
         passthrough: dict[str, Any] | None = None,
         inbound_anthropic_body: dict[str, Any] | None = None,
+        raw_openai_tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """Stream via NDJSON from /api/chat.
 
-        ``passthrough`` / ``inbound_anthropic_body`` accepted for protocol
-        symmetry; see ``send`` notes.
+        ``passthrough`` / ``inbound_anthropic_body`` / ``raw_openai_tools``
+        accepted for protocol symmetry; see ``send`` notes.
         """
         body: dict[str, Any] = {
             "model": self.model,
@@ -302,8 +308,8 @@ class OllamaClient:
                         )
                         final: LLMResponse = [
                             ToolCall(
-                                tool=tc["function"]["name"],
-                                args=tc["function"].get("arguments", {}),
+                                tool=tc.get("function", {}).get("name", ""),
+                                args=tc.get("function", {}).get("arguments", {}),
                                 reasoning=reasoning if i == 0 else None,
                             )
                             for i, tc in enumerate(tool_calls)

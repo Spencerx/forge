@@ -67,7 +67,8 @@ class ProxyServer:
         serialize: bool | None = None,
         max_retries: int = 3,
         rescue_enabled: bool = True,
-        mode: Literal["native", "prompt"] = "native",
+        backend_capability: Literal["native", "prompt"] = "native",
+        inject_respond_tool: bool = False,
         backend_protocol: Literal["openai", "anthropic"] = "openai",
         backend_timeout: float = 300.0,
     ) -> None:
@@ -93,11 +94,20 @@ class ProxyServer:
                 managed, False for external).
             max_retries: Max consecutive retries for bad LLM responses.
             rescue_enabled: Attempt rescue parsing of text responses.
-            mode: Function-calling mode for OpenAI-compatible backends —
-                "native" uses the backend's native tools API, "prompt"
-                uses forge's prompt-injection fallback for backends
-                without a function-calling template. Not applicable to vLLM
-                (parses tool calls server-side) or the Anthropic protocol.
+            backend_capability: Tool-calling protocol for the backend.
+                ``native`` (default) forwards the client's OpenAI tools/messages
+                verbatim to a function-calling-capable backend (transparent
+                passthrough). ``prompt`` opts into prompt-injection for a non-FC
+                llama.cpp/llamafile backend — tools are stripped into the prompt
+                and the JSON tool call is parsed back out (the same path the
+                WorkflowRunner uses). Only valid for llama.cpp/llamafile
+                backends; rejected for vllm/ollama and the anthropic protocol.
+                Selected once at construction and frozen — never probed or
+                switched mid-stream.
+            inject_respond_tool: When True, inject forge's synthetic respond()
+                tool into requests that already carry tools (keeps the model in
+                tool-calling mode). Default False. Orthogonal to
+                backend_capability — works in both native and prompt modes.
             backend_protocol: Wire format of the external backend.
                 ``openai`` (default) for llama.cpp, vLLM, Ollama. ``anthropic``
                 for Anthropic-shape downstreams (the official Anthropic API,
@@ -108,13 +118,6 @@ class ProxyServer:
         """
         if backend_url is None and backend is None:
             raise ValueError("Provide either backend_url (external) or backend (managed)")
-        if backend_protocol == "anthropic" and mode == "prompt":
-            raise ValueError(
-                "mode='prompt' is not supported with backend_protocol='anthropic' — "
-                "Anthropic protocol has native tool calling; the prompt-injection "
-                "fallback only applies to OpenAI-shape backends without a function-"
-                "calling template."
-            )
         if backend_protocol == "anthropic" and backend_url is None:
             raise ValueError(
                 "backend_protocol='anthropic' requires external mode (backend_url=...). "
@@ -125,11 +128,22 @@ class ProxyServer:
                 "backend='vllm' speaks the OpenAI protocol; backend_protocol='anthropic' "
                 "is not applicable."
             )
-        if backend == "vllm" and mode == "prompt":
-            raise ValueError(
-                "backend='vllm' parses tool calls server-side (native only); "
-                "mode='prompt' is not applicable."
-            )
+        # Prompt-injection is a llama.cpp/llamafile capability only. vLLM and
+        # Ollama clients are native-only (they accept-ignore raw tools and have
+        # no prompt path); the anthropic protocol does its own tool conversion.
+        # backend=None (external) defaults to the llama.cpp adapter, which
+        # supports prompt — so only vllm/ollama and anthropic are rejected.
+        if backend_capability == "prompt":
+            if backend_protocol == "anthropic":
+                raise ValueError(
+                    "backend_capability='prompt' is not supported with the "
+                    "anthropic protocol (native tool calling only)."
+                )
+            if backend in ("vllm", "ollama"):
+                raise ValueError(
+                    f"backend_capability='prompt' is only supported for "
+                    f"llama.cpp/llamafile backends, not backend={backend!r}."
+                )
         if not math.isfinite(backend_timeout) or backend_timeout <= 0:
             raise ValueError("backend_timeout must be a finite value greater than 0")
         # Managed mode: each backend requires its own identity field. Fail
@@ -155,7 +169,8 @@ class ProxyServer:
         self._port = port
         self._max_retries = max_retries
         self._rescue_enabled = rescue_enabled
-        self._mode = mode
+        self._backend_capability = backend_capability
+        self._inject_respond_tool = inject_respond_tool
         self._backend_protocol = backend_protocol
         self._backend_timeout = backend_timeout
 
@@ -196,7 +211,11 @@ class ProxyServer:
         if not self._started:
             raise RuntimeError("Proxy failed to start")
 
-        logger.info("Proxy ready at %s", self.url)
+        logger.info(
+            "Proxy ready at %s (backend_timeout=%.1fs)",
+            self.url,
+            self._backend_timeout,
+        )
 
     def stop(self) -> None:
         """Stop the proxy (and managed backend if applicable)."""
@@ -236,6 +255,8 @@ class ProxyServer:
             serialize_requests=self._serialize,
             max_retries=self._max_retries,
             rescue_enabled=self._rescue_enabled,
+            native_passthrough=self._backend_capability == "native",
+            inject_respond_tool=self._inject_respond_tool,
         )
         await self._http_server.start()
         self._started = True
@@ -293,8 +314,7 @@ class ProxyServer:
             served = await client.get_served_model_name()
             if served:
                 logger.info("Discovered vLLM served model name: %s", served)
-                client.model_path = served
-                client.model = served
+                client._set_model_identity(served)
             else:
                 logger.warning(
                     "Could not discover a served model name from %s/models; "
@@ -310,7 +330,7 @@ class ProxyServer:
             client = LlamafileClient(
                 gguf_path=self._model or "default",
                 base_url=base,
-                mode=self._mode,
+                mode=self._backend_capability,
                 timeout=self._backend_timeout,
             )
 
@@ -336,11 +356,13 @@ class ProxyServer:
         assert self._backend is not None
         client = self._build_managed_client()
 
-        # The backend process is always launched in native mode (--jinja is
-        # harmless and enables the native tools API where available); prompt
-        # mode is a client-side injection concern carried by the client.
-        # Pass each backend only its own identity field — setup_backend
-        # enforces mutual exclusivity.
+        # The backend process is always launched in native mode (--jinja enables
+        # the native tools API). This is independent of backend_capability: in
+        # prompt capability the proxy simply doesn't send native tools, so a
+        # native-launched backend (jinja template present but unused) serves the
+        # prompt-injected request fine. Keeping launch native avoids changing
+        # backend startup flags for the opt-in path. Pass each backend only its
+        # own identity field — setup_backend enforces mutual exclusivity.
         server, context_manager = await setup_backend(
             backend=self._backend,
             model=self._model if self._backend == "ollama" else None,
@@ -369,7 +391,7 @@ class ProxyServer:
             return LlamafileClient(
                 gguf_path=self._gguf or "default",
                 base_url=base_url,
-                mode=self._mode,
+                mode=self._backend_capability,
                 timeout=self._backend_timeout,
             )
         if self._backend == "vllm":

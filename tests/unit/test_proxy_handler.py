@@ -148,12 +148,13 @@ class TestWithTools:
 
     @pytest.mark.asyncio
     async def test_respond_tool_auto_injected(self):
-        """Respond tool is injected — model calling respond returns text."""
+        """With inject_respond_tool=True, a respond() call is stripped to text."""
         client = _mock_client([ToolCall(tool="respond", args={"message": "Hi!"})])
         client.last_usage = {0: TokenUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)}
-        
+
         result = await handle_chat_completions(
             _body(tools=[_tool_def("search")]), client, _context_manager(),
+            inject_respond_tool=True,
         )
         # respond is stripped — client sees text, not a tool call
         assert result["choices"][0]["message"]["content"] == "Hi!"
@@ -183,9 +184,10 @@ class TestWithTools:
             ToolCall(tool="respond", args={"message": "also this"}),
         ])
         client.last_usage = {0: TokenUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15)}
-        
+
         result = await handle_chat_completions(
             _body(tools=[_tool_def("search")]), client, _context_manager(),
+            inject_respond_tool=True,
         )
         tc = result["choices"][0]["message"]["tool_calls"]
         assert len(tc) == 1
@@ -201,8 +203,9 @@ class TestWithTools:
         tools = [_tool_def("search"), _tool_def("respond")]
         result = await handle_chat_completions(
             _body(tools=tools), client, _context_manager(),
+            inject_respond_tool=True,
         )
-        # Should still work — respond stripped to text
+        # Should still work — respond stripped to text (not double-injected)
         assert result["choices"][0]["message"]["content"] == "Hi!"
         assert result["usage"] == {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
 
@@ -467,3 +470,128 @@ class TestAnthropicProtocol:
         api_messages = client.send.call_args.args[0]
         assert api_messages[0]["role"] == "system"
         assert api_messages[0]["content"] == "You are helpful."
+
+
+# ── Native transparent passthrough ──────────────────────────
+
+
+class TestNativePassthrough:
+    """The proxy forwards the client's OpenAI tools/messages verbatim on the
+    clean first attempt, bypassing the lossy ToolSpec round-trip."""
+
+    @pytest.mark.asyncio
+    async def test_raw_tools_forwarded_verbatim(self):
+        client = _mock_client([ToolCall(tool="search", args={"q": "x"})])
+        params = {
+            "type": "object",
+            "properties": {"q": {"type": "string", "description": "the query"}},
+            "required": ["q"],
+            "additionalProperties": False,
+        }
+        tools = [_tool_def("search", parameters=params)]
+        await handle_chat_completions(
+            _body(tools=tools), client, _context_manager(),
+        )
+        # The backend sees the client's exact tools array (full schema, no
+        # name/schema drift), not forge's reconstructed format_tool output.
+        sent = client.send.call_args.kwargs["raw_openai_tools"]
+        assert sent == tools
+        # Respond is NOT appended by default.
+        assert [t["function"]["name"] for t in sent] == ["search"]
+        # tool_specs (validation sidecar) still passed separately.
+        assert client.send.call_args.kwargs["tools"][0].name == "search"
+
+    @pytest.mark.asyncio
+    async def test_raw_messages_forwarded_verbatim(self):
+        client = _mock_client([ToolCall(tool="search", args={"q": "x"})])
+        # An extra non-standard key proves no normalization/folding happened.
+        messages = [{"role": "user", "content": "hi", "name": "u1"}]
+        await handle_chat_completions(
+            _body(messages=messages, tools=[_tool_def("search")]),
+            client, _context_manager(),
+        )
+        sent_messages = client.send.call_args.args[0]
+        assert sent_messages == messages
+
+    @pytest.mark.asyncio
+    async def test_inbound_body_mutation_does_not_affect_sent(self):
+        client = _mock_client([ToolCall(tool="search", args={"q": "x"})])
+        tools = [_tool_def("search")]
+        body = _body(tools=tools)
+        await handle_chat_completions(body, client, _context_manager())
+        # Mutate the caller's body after the call — detached copy is unaffected.
+        body["tools"][0]["function"]["name"] = "MUTATED"
+        body["messages"][0]["content"] = "MUTATED"
+        sent_tools = client.send.call_args.kwargs["raw_openai_tools"]
+        sent_messages = client.send.call_args.args[0]
+        assert sent_tools[0]["function"]["name"] == "search"
+        assert sent_messages[0]["content"] == "hi"
+
+    @pytest.mark.asyncio
+    async def test_respond_not_injected_by_default(self):
+        client = _mock_client([ToolCall(tool="search", args={"q": "x"})])
+        await handle_chat_completions(
+            _body(tools=[_tool_def("search")]), client, _context_manager(),
+        )
+        sent = client.send.call_args.kwargs["raw_openai_tools"]
+        names = [t["function"]["name"] for t in sent]
+        assert "respond" not in names
+        spec_names = [s.name for s in client.send.call_args.kwargs["tools"]]
+        assert "respond" not in spec_names
+
+    @pytest.mark.asyncio
+    async def test_respond_injected_into_raw_tools_when_opted_in(self):
+        client = _mock_client([ToolCall(tool="search", args={"q": "x"})])
+        await handle_chat_completions(
+            _body(tools=[_tool_def("search")]), client, _context_manager(),
+            inject_respond_tool=True,
+        )
+        sent = client.send.call_args.kwargs["raw_openai_tools"]
+        names = [t["function"]["name"] for t in sent]
+        assert names == ["search", "respond"]
+
+
+# ── Prompt capability handoff ───────────────────────────────
+
+
+class TestPromptCapabilityHandoff:
+    """In prompt capability (native_passthrough=False) the handler suppresses
+    the verbatim passthrough so the request folds normally and the client's
+    prompt path injects the tools. (The injection itself is covered by the
+    LlamafileClient prompt-mode tests.)"""
+
+    @pytest.mark.asyncio
+    async def test_prompt_mode_suppresses_raw_tools(self):
+        client = _mock_client([ToolCall(tool="search", args={"q": "x"})])
+        await handle_chat_completions(
+            _body(tools=[_tool_def("search")]), client, _context_manager(),
+            native_passthrough=False,
+        )
+        # No verbatim tools forwarded — the client's prompt path injects them.
+        assert "raw_openai_tools" not in client.send.call_args.kwargs
+        # tool_specs (the source for build_tool_prompt) are still passed.
+        assert client.send.call_args.kwargs["tools"][0].name == "search"
+
+    @pytest.mark.asyncio
+    async def test_prompt_mode_folds_messages_not_verbatim(self):
+        client = _mock_client([ToolCall(tool="search", args={"q": "x"})])
+        # A non-standard key would survive verbatim passthrough but is dropped
+        # by fold_and_serialize — proving the raw transcript was NOT forwarded.
+        messages = [{"role": "user", "content": "hi", "name": "u1"}]
+        await handle_chat_completions(
+            _body(messages=messages, tools=[_tool_def("search")]),
+            client, _context_manager(), native_passthrough=False,
+        )
+        sent_messages = client.send.call_args.args[0]
+        assert sent_messages != messages
+        assert "name" not in sent_messages[0]
+
+    @pytest.mark.asyncio
+    async def test_native_default_still_forwards_raw(self):
+        # Sanity: default (native) path is unaffected by the new param.
+        client = _mock_client([ToolCall(tool="search", args={"q": "x"})])
+        tools = [_tool_def("search")]
+        await handle_chat_completions(
+            _body(tools=tools), client, _context_manager(),
+        )
+        assert client.send.call_args.kwargs["raw_openai_tools"] == tools
