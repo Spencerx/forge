@@ -17,6 +17,8 @@ from forge.clients.base import (
     TokenUsage,
     decode_tool_args,
     format_tool,
+    resolve_request_headers,
+    static_auth_present,
 )
 from forge.clients.sampling_defaults import apply_sampling_defaults
 from forge.core.workflow import LLMResponse, TextResponse, ToolCall, ToolSpec
@@ -143,6 +145,8 @@ class LlamafileClient:
         cache_prompt: bool = True,
         slot_id: int | None = None,
         recommended_sampling: bool = False,
+        api_key: str = "",
+        extra_headers: dict[str, str] | None = None,
     ) -> None:
         if mode not in ("native", "prompt"):
             raise ValueError(
@@ -178,7 +182,19 @@ class LlamafileClient:
             else defaults.get("chat_template_kwargs")
         )
         self.mode = mode
-        self._http = httpx.AsyncClient(timeout=timeout)
+        # Optional backend auth (api_key → Authorization: Bearer; extra_headers
+        # ride on top). This is the proxy's OpenAI-shape external client, so a
+        # gateway in front of llama.cpp may require a credential. One credential
+        # per request: validate the static config (raises on api_key + a
+        # construction auth header) BEFORE opening the pool so a conflict fails
+        # fast; a per-call auth header is later refused when a static one is set.
+        self._static_auth = static_auth_present(api_key, extra_headers)
+        headers: dict[str, str] = {}
+        if api_key and api_key.strip():
+            headers["Authorization"] = f"Bearer {api_key}"
+        if extra_headers:
+            headers.update(extra_headers)
+        self._http = httpx.AsyncClient(headers=headers, timeout=timeout)
         self._think: bool = think if think is not None else True  # think=None → capture
         self._cache_prompt = cache_prompt
         self._slot_id = slot_id
@@ -188,6 +204,17 @@ class LlamafileClient:
     async def aclose(self) -> None:
         """Close the underlying httpx connection pool."""
         await self._http.aclose()
+
+    def _request_headers(
+        self, extra_headers: dict[str, str] | None,
+    ) -> dict[str, str] | None:
+        """Per-call headers to apply, enforcing the one-credential rule.
+
+        Returns the dict to pass as httpx ``headers=`` (merged over the
+        construction headers, request winning), or None. Never mutates the
+        shared client's construction headers.
+        """
+        return resolve_request_headers(self._static_auth, extra_headers)
 
     def _apply_slot_id(self, body: dict[str, Any]) -> None:
         """Inject slot_id into a request body if configured."""
@@ -270,6 +297,7 @@ class LlamafileClient:
         passthrough: dict[str, Any] | None = None,
         inbound_anthropic_body: dict[str, Any] | None = None,
         raw_openai_tools: RawOpenAITools | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> LLMResponse:
         """Dispatch to the native or prompt-injected path per the declared mode.
 
@@ -279,12 +307,18 @@ class LlamafileClient:
         ``raw_openai_tools`` (proxy use) is forwarded verbatim as the
         backend's ``tools`` array on the native path; the prompt path
         accepts and ignores it (it keeps forge's prompt-injection format).
+
+        ``extra_headers`` carries the per-call credential and is forwarded to
+        both the native and prompt paths.
         """
         if self.mode == "native":
             return await self._send_native(
                 messages, tools, sampling, passthrough, raw_openai_tools,
+                extra_headers,
             )
-        return await self._send_prompt(messages, tools, sampling, passthrough)
+        return await self._send_prompt(
+            messages, tools, sampling, passthrough, extra_headers,
+        )
 
     async def send_stream(
         self,
@@ -294,12 +328,14 @@ class LlamafileClient:
         passthrough: dict[str, Any] | None = None,
         inbound_anthropic_body: dict[str, Any] | None = None,
         raw_openai_tools: RawOpenAITools | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """Stream via SSE, handling both native FC and prompt-injected paths.
 
         ``inbound_anthropic_body`` accepted for protocol symmetry, ignored.
         ``raw_openai_tools`` (proxy use) is forwarded verbatim on the native
-        path; ignored on the prompt path.
+        path; ignored on the prompt path. ``extra_headers`` carries the
+        per-call credential.
         """
         mode = self.mode
 
@@ -341,7 +377,10 @@ class LlamafileClient:
         tool_call_parts: dict[int, dict[str, str]] = {}  # idx -> {name, args}
 
         async with self._http.stream(
-            "POST", f"{self.base_url}/chat/completions", json=body
+            "POST",
+            f"{self.base_url}/chat/completions",
+            json=body,
+            headers=self._request_headers(extra_headers),
         ) as response:
             if response.status_code == 500:
                 error_body = ""
@@ -444,6 +483,45 @@ class LlamafileClient:
         except (ValueError, KeyError, TypeError) as exc:
             raise ContextDiscoveryError(exc) from exc
 
+    async def discover_backend_metadata(
+        self, extra_headers: dict[str, str] | None = None,
+    ) -> int | None:
+        """Probe /props once for the context budget, credentialed.
+
+        llama.cpp ignores the wire ``model`` field, so there is no identity to
+        adopt — this returns the context length (``n_ctx``) and nothing else.
+        Carries ``extra_headers`` so a gateway in front of llama.cpp can
+        authenticate the probe on the first request. Raises ``BackendError`` on
+        a rejected, unreachable, or unparseable probe (so the proxy maps it to a
+        clean status); returns None when /props reports no ``n_ctx`` (the caller
+        fails loud rather than guessing a budget).
+        """
+        base = self.base_url.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+
+        try:
+            resp = await self._http.get(
+                f"{base}/props", headers=self._request_headers(extra_headers),
+            )
+        except httpx.HTTPError as exc:
+            raise BackendError(502, f"llama.cpp /props unreachable: {exc}") from exc
+        if resp.status_code != 200:
+            raise BackendError(resp.status_code, raw_body=resp.text)
+
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            raise BackendError(502, f"llama.cpp /props returned non-JSON: {exc}") from exc
+        settings = body.get("default_generation_settings", {}) if isinstance(body, dict) else {}
+        n_ctx = settings.get("n_ctx") if isinstance(settings, dict) else None
+        if n_ctx is None:
+            return None
+        try:
+            return int(n_ctx)
+        except (ValueError, TypeError) as exc:
+            raise BackendError(502, f"llama.cpp /props n_ctx not an integer: {exc}") from exc
+
     async def _send_native(
         self,
         messages: list[dict[str, str]],
@@ -451,12 +529,14 @@ class LlamafileClient:
         sampling: dict[str, Any] | None = None,
         passthrough: dict[str, Any] | None = None,
         raw_openai_tools: RawOpenAITools | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> LLMResponse:
         """Send using native function calling (OpenAI tools parameter).
 
         When ``raw_openai_tools`` is supplied (proxy native passthrough), it is
         sent as the ``tools`` array verbatim so the backend sees the client's
         original schema instead of forge's re-emitted ``format_tool(spec)``.
+        ``extra_headers`` carries the per-call credential.
         """
         merged = _merge_consecutive(messages)
         body: dict[str, Any] = dict(passthrough or {})
@@ -473,12 +553,14 @@ class LlamafileClient:
             body["tools"] = [format_tool(t) for t in tools]
 
         resp = await self._http.post(
-            f"{self.base_url}/chat/completions", json=body
+            f"{self.base_url}/chat/completions",
+            json=body,
+            headers=self._request_headers(extra_headers),
         )
         if resp.status_code == 500:
             return TextResponse(content=resp.text)
         if resp.status_code != 200:
-            raise BackendError(resp.status_code, resp.text)
+            raise BackendError(resp.status_code, raw_body=resp.text)
         data = resp.json()
         self._record_usage(data)
 
@@ -515,8 +597,12 @@ class LlamafileClient:
         tools: list[ToolSpec] | None,
         sampling: dict[str, Any] | None = None,
         passthrough: dict[str, Any] | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> LLMResponse:
-        """Send using prompt-injected tool calling."""
+        """Send using prompt-injected tool calling.
+
+        ``extra_headers`` carries the per-call credential.
+        """
         prepared = _merge_consecutive(_downgrade_messages(messages))
         if tools:
             tool_prompt = build_tool_prompt(tools)
@@ -535,7 +621,9 @@ class LlamafileClient:
         self._apply_sampling(body, sampling)
 
         resp = await self._http.post(
-            f"{self.base_url}/chat/completions", json=body
+            f"{self.base_url}/chat/completions",
+            json=body,
+            headers=self._request_headers(extra_headers),
         )
         resp.raise_for_status()
         data = resp.json()

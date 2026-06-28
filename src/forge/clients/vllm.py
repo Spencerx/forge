@@ -19,17 +19,28 @@ Differences from LlamafileClient:
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from forge.clients.base import ChunkType, StreamChunk, TokenUsage, decode_tool_args, format_tool
+from forge.clients.base import (
+    ChunkType,
+    StreamChunk,
+    TokenUsage,
+    decode_tool_args,
+    format_tool,
+    resolve_request_headers,
+    static_auth_present,
+)
 from forge.clients.sampling_defaults import apply_sampling_defaults
 from forge.core.workflow import LLMResponse, TextResponse, ToolCall, ToolSpec
 from forge.errors import BackendError
 from forge.prompts.think_tags import extract_think_tags
+
+logger = logging.getLogger("forge.clients.vllm")
 
 
 class VLLMClient:
@@ -59,6 +70,8 @@ class VLLMClient:
         timeout: float = 300.0,
         think: bool = True,
         recommended_sampling: bool = False,
+        api_key: str = "",
+        extra_headers: dict[str, str] | None = None,
     ) -> None:
         self.base_url = base_url
         # Two identity roles, set together (see _set_model_identity):
@@ -87,13 +100,36 @@ class VLLMClient:
             chat_template_kwargs if chat_template_kwargs is not None
             else defaults.get("chat_template_kwargs")
         )
-        self._http = httpx.AsyncClient(timeout=timeout)
+        # Optional backend auth (api_key → Authorization: Bearer; extra_headers
+        # ride on top). vLLM servers may be started with --api-key. One
+        # credential per request: validate the static config (raises on api_key
+        # + a construction auth header) BEFORE opening the pool so a conflict
+        # fails fast; a per-call auth header is later refused when a static one
+        # is set here.
+        self._static_auth = static_auth_present(api_key, extra_headers)
+        headers: dict[str, str] = {}
+        if api_key and api_key.strip():
+            headers["Authorization"] = f"Bearer {api_key}"
+        if extra_headers:
+            headers.update(extra_headers)
+        self._http = httpx.AsyncClient(headers=headers, timeout=timeout)
         self._think: bool = think
         self.last_usage: dict[int, TokenUsage] = {}
 
     async def aclose(self) -> None:
         """Close the underlying httpx connection pool."""
         await self._http.aclose()
+
+    def _request_headers(
+        self, extra_headers: dict[str, str] | None,
+    ) -> dict[str, str] | None:
+        """Per-call headers to apply, enforcing the one-credential rule.
+
+        Returns the dict to pass as httpx ``headers=`` (merged over the
+        construction headers, request winning), or None. Never mutates the
+        shared client's construction headers.
+        """
+        return resolve_request_headers(self._static_auth, extra_headers)
 
     @staticmethod
     def _derive_sampling_key(wire_id: str) -> str:
@@ -193,12 +229,14 @@ class VLLMClient:
         passthrough: dict[str, Any] | None = None,
         inbound_anthropic_body: dict[str, Any] | None = None,
         raw_openai_tools: list[dict[str, Any]] | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> LLMResponse:
         """Send messages via /v1/chat/completions and parse the response.
 
         ``passthrough`` / ``inbound_anthropic_body`` / ``raw_openai_tools`` are
         accepted for protocol symmetry and ignored — vLLM parses tools and
-        reasoning server-side and is native-only.
+        reasoning server-side and is native-only. ``extra_headers`` carries the
+        per-call credential, applied over the construction headers.
         """
         body: dict[str, Any] = {
             "model": self.model,
@@ -212,13 +250,15 @@ class VLLMClient:
 
         try:
             resp = await self._http.post(
-                f"{self.base_url}/chat/completions", json=body,
+                f"{self.base_url}/chat/completions",
+                json=body,
+                headers=self._request_headers(extra_headers),
             )
         except httpx.ReadTimeout as exc:
             raise BackendError(408, "Read timeout") from exc
 
         if resp.status_code != 200:
-            raise BackendError(resp.status_code, resp.text)
+            raise BackendError(resp.status_code, raw_body=resp.text)
         data = resp.json()
         self._record_usage(data)
 
@@ -250,11 +290,13 @@ class VLLMClient:
         passthrough: dict[str, Any] | None = None,
         inbound_anthropic_body: dict[str, Any] | None = None,
         raw_openai_tools: list[dict[str, Any]] | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """Stream via SSE from /v1/chat/completions.
 
         ``passthrough`` / ``inbound_anthropic_body`` / ``raw_openai_tools``
         accepted for protocol symmetry and ignored (see ``send``).
+        ``extra_headers`` carries the per-call credential.
         """
         body: dict[str, Any] = {
             "model": self.model,
@@ -274,13 +316,16 @@ class VLLMClient:
         tool_call_parts: dict[int, dict[str, str]] = {}
 
         async with self._http.stream(
-            "POST", f"{self.base_url}/chat/completions", json=body,
+            "POST",
+            f"{self.base_url}/chat/completions",
+            json=body,
+            headers=self._request_headers(extra_headers),
         ) as response:
             if response.status_code != 200:
                 error_body = ""
                 async for line in response.aiter_lines():
                     error_body += line
-                raise BackendError(response.status_code, error_body)
+                raise BackendError(response.status_code, raw_body=error_body)
 
             async for line in response.aiter_lines():
                 line = line.strip()
@@ -418,3 +463,47 @@ class VLLMClient:
         if not models:
             return None
         return models[0].get("id")
+
+    async def discover_backend_metadata(
+        self, extra_headers: dict[str, str] | None = None,
+    ) -> int | None:
+        """Probe /v1/models once for both budget and served identity.
+
+        vLLM exposes ``max_model_len`` (context budget) and the served model
+        ``id`` (the wire ``model`` field it validates) on the same endpoint, so
+        one credentialed GET yields both — collapsing the two separate startup
+        round-trips. The served id is adopted into this client immediately
+        (``_set_model_identity``), and the budget is returned for the caller to
+        apply to the context manager.
+
+        Both fields are required: vLLM 404s every request without a valid served
+        id, and a missing ``max_model_len`` leaves the budget undiscoverable —
+        either is a loud failure (no silent ``"default"`` / no guessed budget).
+        """
+        try:
+            resp = await self._http.get(
+                f"{self.base_url}/models",
+                headers=self._request_headers(extra_headers),
+            )
+        except httpx.HTTPError as exc:
+            raise BackendError(502, f"vLLM /v1/models unreachable: {exc}") from exc
+        if resp.status_code != 200:
+            raise BackendError(resp.status_code, raw_body=resp.text)
+
+        models = resp.json().get("data") or []
+        if not models:
+            raise BackendError(500, "vLLM /v1/models returned no entries")
+        entry = models[0]
+
+        served = entry.get("id")
+        if not served:
+            raise BackendError(500, f"vLLM /v1/models entry missing id: {entry}")
+        logger.info("Discovered vLLM served model name: %s", served)
+        self._set_model_identity(served)
+
+        max_model_len = entry.get("max_model_len")
+        if max_model_len is None:
+            raise BackendError(
+                500, f"vLLM /v1/models entry missing max_model_len: {entry}",
+            )
+        return int(max_model_len)

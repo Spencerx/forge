@@ -18,7 +18,15 @@ from typing import Any
 
 import httpx
 
-from forge.clients.base import ChunkType, StreamChunk, TokenUsage, decode_tool_args, format_tool
+from forge.clients.base import (
+    ChunkType,
+    StreamChunk,
+    TokenUsage,
+    decode_tool_args,
+    format_tool,
+    resolve_request_headers,
+    static_auth_present,
+)
 from forge.clients.sampling_defaults import apply_sampling_defaults
 from forge.core.workflow import LLMResponse, TextResponse, ToolCall, ToolSpec
 from forge.errors import BackendError
@@ -83,11 +91,17 @@ class OpenAICompatClient:
             else defaults.get("chat_template_kwargs")
         )
 
-        # Auth header is set when api_key is provided; extra_headers ride
-        # on top and can override (kept open so a provider with a different
-        # scheme doesn't need a new constructor kwarg).
+        # One credential per request: validate the static config BEFORE opening
+        # the connection pool, so a double-credential conflict (api_key AND a
+        # construction auth header) fails fast without leaking an unclosed
+        # client. The returned bool records whether a static credential is set,
+        # so a per-call auth header is later refused as a second source.
+        self._static_auth = static_auth_present(api_key, extra_headers)
+        # Auth header is set when api_key is provided. Non-auth extra_headers
+        # (e.g. OpenRouter's HTTP-Referer) ride on top. For a non-Bearer auth
+        # scheme, pass extra_headers alone and omit api_key.
         headers: dict[str, str] = {}
-        if api_key:
+        if api_key and api_key.strip():
             headers["Authorization"] = f"Bearer {api_key}"
         if extra_headers:
             headers.update(extra_headers)
@@ -97,6 +111,17 @@ class OpenAICompatClient:
     async def aclose(self) -> None:
         """Close the underlying httpx connection pool."""
         await self._http.aclose()
+
+    def _request_headers(
+        self, extra_headers: dict[str, str] | None,
+    ) -> dict[str, str] | None:
+        """Per-call headers to apply, enforcing the one-credential rule.
+
+        Returns the dict to pass as httpx ``headers=`` (merged over the
+        construction headers, request winning), or None. Never mutates the
+        shared client's construction headers.
+        """
+        return resolve_request_headers(self._static_auth, extra_headers)
 
     # ── request building ─────────────────────────────────────────────
 
@@ -180,22 +205,29 @@ class OpenAICompatClient:
         sampling: dict[str, Any] | None = None,
         passthrough: dict[str, Any] | None = None,
         inbound_anthropic_body: dict[str, Any] | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> LLMResponse:
         """Send messages via /chat/completions and parse the response.
 
         ``inbound_anthropic_body`` is accepted to satisfy the LLMClient
         protocol but ignored — Path-1 Anthropic forwarding doesn't apply
-        to OpenAI-shape clients.
+        to OpenAI-shape clients. ``extra_headers`` carries the per-call
+        credential (relocated inbound auth or a rotating token), applied over
+        the construction headers; a second auth source raises.
         """
         del inbound_anthropic_body  # protocol-only, never read here
         body = self._build_body(messages, tools, sampling, stream=False, passthrough=passthrough)
         try:
-            resp = await self._http.post(f"{self.base_url}/chat/completions", json=body)
+            resp = await self._http.post(
+                f"{self.base_url}/chat/completions",
+                json=body,
+                headers=self._request_headers(extra_headers),
+            )
         except httpx.ReadTimeout as exc:
             raise BackendError(408, "Read timeout") from exc
 
         if resp.status_code != 200:
-            raise BackendError(resp.status_code, resp.text)
+            raise BackendError(resp.status_code, raw_body=resp.text)
 
         data = resp.json()
         self._record_usage(data)
@@ -218,11 +250,13 @@ class OpenAICompatClient:
         sampling: dict[str, Any] | None = None,
         passthrough: dict[str, Any] | None = None,
         inbound_anthropic_body: dict[str, Any] | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """Stream via SSE from /chat/completions.
 
         ``inbound_anthropic_body`` is accepted to satisfy the LLMClient
-        protocol but ignored — see :meth:`send`.
+        protocol but ignored — see :meth:`send`. ``extra_headers`` carries
+        the per-call credential (see :meth:`send`).
         """
         del inbound_anthropic_body  # protocol-only, never read here
         body = self._build_body(messages, tools, sampling, stream=True, passthrough=passthrough)
@@ -232,11 +266,14 @@ class OpenAICompatClient:
         usage: dict[str, Any] | None = None
 
         async with self._http.stream(
-            "POST", f"{self.base_url}/chat/completions", json=body
+            "POST",
+            f"{self.base_url}/chat/completions",
+            json=body,
+            headers=self._request_headers(extra_headers),
         ) as response:
             if response.status_code != 200:
                 error_body = await response.aread()
-                raise BackendError(response.status_code, error_body.decode(errors="replace"))
+                raise BackendError(response.status_code, raw_body=error_body.decode(errors="replace"))
 
             async for line in response.aiter_lines():
                 if not line.startswith("data: "):
@@ -296,4 +333,13 @@ class OpenAICompatClient:
 
     async def get_context_length(self) -> int | None:
         """OpenAI-compatible endpoints don't expose context length. Returns None."""
+        return None
+
+    async def discover_backend_metadata(
+        self, extra_headers: dict[str, str] | None = None,
+    ) -> int | None:
+        """OpenAI-compatible endpoints expose neither context length nor a
+        discoverable identity. Returns None (Protocol uniformity); not wired
+        into the proxy's deferred external path.
+        """
         return None

@@ -6,18 +6,90 @@ produces) and Anthropic's native Messages API format internally.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
-from collections.abc import AsyncIterator
+import os
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 import anthropic
 
-from forge.clients.base import ChunkType, StreamChunk, TokenUsage, decode_tool_args
+from forge.clients.base import (
+    ChunkType,
+    StreamChunk,
+    TokenUsage,
+    decode_tool_args,
+    has_auth_header,
+    resolve_request_headers,
+    static_auth_present,
+)
 from forge.core.workflow import LLMResponse, TextResponse, ToolCall, ToolSpec
-from forge.errors import BackendError
+from forge.errors import BackendError, MissingCredentialError
 
 log = logging.getLogger(__name__)
+
+# The Anthropic SDK pins these headers itself — ``anthropic-version`` is part
+# of its wire contract. A forwarded inbound value must not clobber them, so we
+# drop them from any forge-forwarded header set.
+_ANTHROPIC_PINNED_HEADERS = frozenset({"anthropic-version", "anthropic-beta"})
+
+# The SDK's auth preflight (``_validate_headers``) reads these keys
+# case-SENSITIVELY from a plain dict before the request goes out. The proxy
+# lowercases all inbound header keys, so a relocated ``x-api-key`` would fail
+# the preflight ("Could not resolve authentication method") unless re-cased to
+# exactly what the SDK expects. forge never inspects the credential value.
+_SDK_AUTH_CASING = {"authorization": "Authorization", "x-api-key": "X-Api-Key"}
+
+# SDK request-control kwargs that must never be sourced from an inbound body or
+# passthrough — they are client-side controls (headers/query/timeout), not
+# Anthropic Messages API fields. In particular a body-supplied ``extra_headers``
+# would smuggle an auth header into ``messages.create`` past the one-credential
+# gate, so these are stripped before forge sets its own per-call credential.
+_SDK_CONTROL_KWARGS = ("extra_headers", "extra_body", "extra_query", "timeout")
+
+# Env vars the Anthropic SDK reads for auth when api_key/auth_token are unset.
+# Suppressed while forge constructs a client it owns the credential for, so an
+# ambient value can't inject a hidden second credential the per-request gate
+# never sees.
+_AMBIENT_ANTHROPIC_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+
+
+@contextlib.contextmanager
+def _suppressed_ambient_credentials() -> Iterator[None]:
+    """Temporarily clear Anthropic credential env vars, then restore them.
+
+    Used only around SDK construction for forge-owned-credential clients (the
+    proxy). forge may itself run evals that rely on these env vars in another
+    client/process, so they are restored immediately after construction.
+    """
+    saved = {k: os.environ.pop(k, None) for k in _AMBIENT_ANTHROPIC_ENV}
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is not None:
+                os.environ[key] = value
+
+
+def _prepare_anthropic_headers(
+    headers: dict[str, str] | None,
+) -> dict[str, str] | None:
+    """Canonicalize auth-header casing for the SDK and drop SDK-pinned headers.
+
+    Returns a new dict (or None). Auth headers are re-cased to the SDK's
+    case-sensitive expectation; ``anthropic-version``/``anthropic-beta`` are
+    dropped so the SDK's own pinned version wins.
+    """
+    if not headers:
+        return None
+    prepared: dict[str, str] = {}
+    for k, v in headers.items():
+        kl = k.lower()
+        if kl in _ANTHROPIC_PINNED_HEADERS:
+            continue
+        prepared[_SDK_AUTH_CASING.get(kl, k)] = v
+    return prepared or None
 
 
 class AnthropicClient:
@@ -42,6 +114,7 @@ class AnthropicClient:
         base_url: str | None = None,
         prompt_caching: bool = False,
         thinking: dict[str, Any] | None = None,
+        default_headers: dict[str, str] | None = None,
     ) -> None:
         self.model = model
         self.max_tokens = max_tokens
@@ -65,16 +138,44 @@ class AnthropicClient:
             log.debug(
                 "AnthropicClient ignores recommended_sampling=True — no sampling kwargs are exposed."
             )
+        # One credential per request. ``static_auth`` reflects an explicitly
+        # configured static credential (an ``api_key`` argument or an auth
+        # header in ``default_headers``); a per-call auth header is then refused
+        # as a second source.
+        self._static_auth = static_auth_present(api_key, default_headers)
+        # Credential ownership has three modes, keyed on ``api_key``:
+        #   None  — WorkflowRunner direct use: defer to the SDK's own env-based
+        #           auth (ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN), the dev's
+        #           deliberate single credential. forge stays out of it.
+        #   ""    — proxy pure passthrough: forge holds NO static credential and
+        #           the per-call forwarded header is the sole auth. Map to None
+        #           so the SDK emits no auth header at all (api_key="" would emit
+        #           a spurious empty X-Api-Key that collides with a per-call
+        #           Authorization on the OAuth path).
+        #   "key" — explicit static credential (proxy --backend-api-key, or an
+        #           explicit WR key).
+        # Whenever forge owns the credential (api_key is not None, including
+        # ""), suppress ambient ANTHROPIC_* env during construction so a stray
+        # ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN can't become a silent second
+        # credential the per-request gate never sees.
+        forge_owns_credential = api_key is not None
         sdk_kwargs: dict[str, Any] = {
-            "api_key": api_key,
+            "api_key": api_key or None,
             "timeout": timeout,
             "max_retries": max_retries,
         }
+        prepared_default_headers = _prepare_anthropic_headers(default_headers)
+        if prepared_default_headers:
+            sdk_kwargs["default_headers"] = prepared_default_headers
         # base_url retargets the SDK at an Anthropic-shape downstream
         # (LiteLLM, a self-hosted proxy, etc.) — proxy path 1.
         if base_url is not None:
             sdk_kwargs["base_url"] = base_url
-        self._client = anthropic.AsyncAnthropic(**sdk_kwargs)
+        if forge_owns_credential:
+            with _suppressed_ambient_credentials():
+                self._client = anthropic.AsyncAnthropic(**sdk_kwargs)
+        else:
+            self._client = anthropic.AsyncAnthropic(**sdk_kwargs)
         # Populated after each send()/send_stream() call. Slot-keyed
         # ``{slot_id: TokenUsage}`` to match LlamafileClient / OllamaClient so
         # ``inference._get_usage`` reads every client uniformly. The Anthropic
@@ -85,6 +186,39 @@ class AnthropicClient:
     async def aclose(self) -> None:
         """Close the underlying Anthropic SDK client (and its httpx pool)."""
         await self._client.close()
+
+    def _sdk_extra_headers(
+        self, extra_headers: dict[str, str] | None,
+    ) -> dict[str, str] | None:
+        """Per-call SDK headers, enforcing the one-credential rule.
+
+        Validates against a static construction credential (raises on a second
+        source), then re-cases auth headers to the SDK's case-sensitive
+        expectation and drops SDK-pinned version headers. Passed via the SDK's
+        per-call ``extra_headers=`` — never set as ``default_headers`` (the
+        proxy shares one client instance, so a per-request credential must not
+        leak into later requests).
+        """
+        return _prepare_anthropic_headers(
+            resolve_request_headers(self._static_auth, extra_headers)
+        )
+
+    def _ensure_credential(self, sdk_headers: dict[str, str] | None) -> None:
+        """Fail loud if this request would reach the backend with no credential.
+
+        A credential is present iff the SDK client resolved a construction key
+        (``api_key`` or ``auth_token``, incl. ambient env at build time) or this
+        call carries a per-call auth header. With none, the Anthropic SDK refuses
+        the request with an opaque error surfaced as HTTP 502; forge raises a
+        clear MissingCredentialError (mapped to 401) instead. Never inspects the
+        secret value.
+        """
+        if (
+            self._client.api_key is None
+            and self._client.auth_token is None
+            and not has_auth_header(sdk_headers)
+        ):
+            raise MissingCredentialError("Anthropic backend")
 
     # ── Tool schema conversion ───────────────────────────────────
 
@@ -340,6 +474,7 @@ class AnthropicClient:
         passthrough: dict[str, Any] | None = None,
         inbound_anthropic_body: dict[str, Any] | None = None,
         raw_openai_tools: list[dict[str, Any]] | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> LLMResponse:
         """Send messages via the Anthropic Messages API.
 
@@ -349,7 +484,9 @@ class AnthropicClient:
         ``inbound_anthropic_body`` (path 1) triggers verbatim emit — see
         ADR-015 for the cache_control preservation rationale.
         ``raw_openai_tools`` accepted for protocol symmetry, ignored
-        (Anthropic uses its own tool conversion).
+        (Anthropic uses its own tool conversion). ``extra_headers`` carries the
+        per-call credential, re-cased for the SDK and forwarded via the SDK's
+        per-call ``extra_headers=``.
         """
         if sampling:
             log.debug(
@@ -359,6 +496,14 @@ class AnthropicClient:
         kwargs = self._build_kwargs(
             messages, tools, passthrough, inbound_anthropic_body,
         )
+        # Strip SDK control kwargs that a verbatim/passthrough body could carry
+        # before forge installs its own per-call credential.
+        for control_kwarg in _SDK_CONTROL_KWARGS:
+            kwargs.pop(control_kwarg, None)
+        sdk_headers = self._sdk_extra_headers(extra_headers)
+        self._ensure_credential(sdk_headers)
+        if sdk_headers:
+            kwargs["extra_headers"] = sdk_headers
         try:
             response = await self._client.messages.create(**kwargs)
         except anthropic.APIError as exc:
@@ -388,6 +533,7 @@ class AnthropicClient:
         passthrough: dict[str, Any] | None = None,
         inbound_anthropic_body: dict[str, Any] | None = None,
         raw_openai_tools: list[dict[str, Any]] | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """Stream via the Anthropic Messages API.
 
@@ -395,6 +541,7 @@ class AnthropicClient:
         ``passthrough`` merges inbound-body extras into the SDK call.
         ``inbound_anthropic_body`` (path 1) triggers verbatim emit; see ADR-015.
         ``raw_openai_tools`` accepted for protocol symmetry, ignored.
+        ``extra_headers`` carries the per-call credential (see :meth:`send`).
         """
         if sampling:
             log.debug(
@@ -404,6 +551,14 @@ class AnthropicClient:
         kwargs = self._build_kwargs(
             messages, tools, passthrough, inbound_anthropic_body,
         )
+        # Strip SDK control kwargs that a verbatim/passthrough body could carry
+        # before forge installs its own per-call credential.
+        for control_kwarg in _SDK_CONTROL_KWARGS:
+            kwargs.pop(control_kwarg, None)
+        sdk_headers = self._sdk_extra_headers(extra_headers)
+        self._ensure_credential(sdk_headers)
+        if sdk_headers:
+            kwargs["extra_headers"] = sdk_headers
 
         accumulated_text = ""
         # Track multiple tool_use blocks by index.
@@ -474,4 +629,15 @@ class AnthropicClient:
 
     async def get_context_length(self) -> int | None:
         """Claude models have 200K context."""
+        return 200_000
+
+    async def discover_backend_metadata(
+        self, extra_headers: dict[str, str] | None = None,
+    ) -> int | None:
+        """Static 200K context, no probe and no identity to adopt.
+
+        The Anthropic path reports a known context length without a network
+        call, so it is never deferred — this exists for Protocol uniformity and
+        ignores ``extra_headers``.
+        """
         return 200_000

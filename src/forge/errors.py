@@ -186,12 +186,28 @@ class BudgetResolutionError(ForgeError):
 
 
 class BackendError(ForgeError):
-    """Unexpected HTTP error from the LLM backend."""
+    """Unexpected HTTP error from the LLM backend.
 
-    def __init__(self, status_code: int, body: str):
-        super().__init__(f"Backend returned {status_code}: {body}")
+    ``detail`` is a forge-authored summary and IS part of the message — safe to
+    log (forge never writes a secret into it). A backend's RAW response body must
+    be passed as ``raw_body`` instead: a gateway could echo an inbound credential
+    into it, and the message is what gets logged and returned to callers, so the
+    raw body is kept on ``exc.body`` for debugging but never placed in the
+    message. Read ``exc.body`` when you need the raw detail — and don't log it
+    where a secret would be unwelcome.
+    """
+
+    def __init__(
+        self, status_code: int, detail: str = "", *, raw_body: str | None = None,
+    ):
+        message = f"Backend returned {status_code}"
+        if detail:
+            message = f"{message}: {detail}"
+        super().__init__(message)
         self.status_code = status_code
-        self.body = body
+        # The raw backend body when given (kept off the message); otherwise the
+        # forge-authored detail, so ``exc.body`` is always the best available text.
+        self.body = raw_body if raw_body is not None else detail
 
 
 class ThinkingNotSupportedError(BackendError):
@@ -212,3 +228,70 @@ class StreamError(ForgeError):
 
     def __init__(self, message: str = "Stream ended without FINAL chunk"):
         super().__init__(message)
+
+
+class MultipleCredentialsError(ForgeError):
+    """More than one auth credential was present for a single backend call.
+
+    forge carries exactly one credential to the backend (Design Principle #1:
+    fail loud, no silent merge). This is raised when a client holds a static
+    auth credential (set at construction) AND a per-call ``extra_headers``
+    also carries an auth header, or when a single inbound proxy request
+    carries two distinct auth headers. forge never picks a winner or drops
+    one — it refuses the request.
+    """
+
+    def __init__(self, sources: str):
+        super().__init__(
+            f"Multiple credentials present: {sources}. forge accepts exactly "
+            f"one credential per request — pass auth via a single source "
+            f"(the client's construction key OR a per-call/inbound auth header, "
+            f"never both)."
+        )
+        self.sources = sources
+
+
+class MissingCredentialError(ForgeError):
+    """No credential was available for a backend that requires one.
+
+    The counterpart to MultipleCredentialsError: forge would otherwise dispatch
+    a request carrying *zero* credentials. Some backends (the Anthropic SDK in
+    particular) refuse such a request with an opaque client-side error; forge
+    fails loud with a clear one instead. The common trigger is the proxy in
+    pure-passthrough mode (no ``--backend-api-key``) receiving a request with no
+    inbound auth header, pointed at an auth-required backend.
+    """
+
+    def __init__(self, backend: str = "backend"):
+        super().__init__(
+            f"No credential available for the {backend}: forge needs exactly "
+            f"one credential and found none — provide it via an inbound auth "
+            f"header or a static backend key (--backend-api-key)."
+        )
+        self.backend = backend
+
+
+class BackendDiscoveryError(ForgeError):
+    """Deferred external-mode backend discovery failed on the first request.
+
+    In external passthrough mode the proxy defers its startup backend probe
+    (context length, and vLLM's served model identity) to the first request so
+    it can authenticate with that request's inbound credential. When that probe
+    fails — the backend rejected the credential, was unreachable, or returned a
+    shape with no usable context length — forge fails the request loud rather
+    than guessing a budget (Design Principle #1). It does not latch, so a later
+    well-credentialed request retries discovery.
+
+    ``status_code`` carries the backend's HTTP status when the failure was an
+    HTTP rejection (else None), letting the proxy distinguish an auth rejection
+    (401/403 → surfaced as 401) from a backend/connectivity fault (→ 502).
+    """
+
+    def __init__(self, status_code: int | None = None):
+        super().__init__(
+            "Could not discover the backend's context length / model identity "
+            "on the first request: the backend rejected or did not answer the "
+            "probe. Provide --backend-api-key (to authenticate discovery at "
+            "startup) or --budget-tokens (to skip context discovery entirely)."
+        )
+        self.status_code = status_code

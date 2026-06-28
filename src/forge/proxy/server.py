@@ -13,10 +13,21 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from forge.clients.base import LLMClient
+from forge.clients.base import AUTH_HEADER_NAMES, LLMClient
 from forge.context.manager import ContextManager
 from forge.core.reasoning import DEFAULT_REASONING_REPLAY, ReasoningReplay, validate_reasoning_replay
-from forge.proxy.handler import handle_chat_completions
+from forge.errors import (
+    BackendDiscoveryError,
+    BackendError,
+    MissingCredentialError,
+    MultipleCredentialsError,
+)
+from forge.proxy.auth import DUPLICATE_AUTH_MARKER, resolve_inbound_credential
+from forge.proxy.handler import (
+    LazyDiscovery,
+    handle_chat_completions,
+    run_lazy_discovery,
+)
 
 logger = logging.getLogger("forge.proxy")
 
@@ -30,6 +41,9 @@ class _QueueItem:
 
     body: dict[str, Any]
     protocol: str = "openai"
+    # Per-request inbound headers (lowercased). Carries the inbound credential
+    # the handler relocates to the backend. Per-item, never shared.
+    headers: dict[str, str] = field(default_factory=dict)
     future: asyncio.Future = field(default=None)  # type: ignore[assignment]
     cancelled: bool = False
 
@@ -54,9 +68,13 @@ class HTTPServer:
         native_passthrough: bool = True,
         inject_respond_tool: bool = False,
         reasoning_replay: ReasoningReplay = DEFAULT_REASONING_REPLAY,
+        backend_protocol: str = "openai",
+        backend_api_key_present: bool = False,
+        lazy_discovery: LazyDiscovery | None = None,
     ) -> None:
         self._client = client
         self._context_manager = context_manager
+        self._lazy_discovery = lazy_discovery
         self._host = host
         self._port = port
         self._max_retries = max_retries
@@ -65,6 +83,13 @@ class HTTPServer:
         self._native_passthrough = native_passthrough
         self._inject_respond_tool = inject_respond_tool
         self._reasoning_replay = validate_reasoning_replay(reasoning_replay)
+        # Target wire protocol of the backend (relocation target) and whether a
+        # static --backend-api-key is configured (for the two-source check).
+        # The raw key itself never reaches the handler — it is baked into the
+        # backend client at construction; the handler only needs to know it
+        # exists to refuse an inbound credential alongside it.
+        self._backend_protocol = backend_protocol
+        self._backend_api_key_present = backend_api_key_present
         self._server: asyncio.Server | None = None
         self._serialize = serialize_requests
         self._queue: asyncio.Queue[_QueueItem] = asyncio.Queue()
@@ -104,7 +129,7 @@ class HTTPServer:
                 if item.cancelled or item.future.cancelled():
                     logger.info("   Skipping cancelled request")
                     continue
-                result = await self._run_handler(item.body, item.protocol)
+                result = await self._run_handler(item.body, item.protocol, item.headers)
                 if not item.future.done():
                     item.future.set_result(result)
             except asyncio.CancelledError:
@@ -166,9 +191,13 @@ class HTTPServer:
             elif method == "GET" and path == "/v1/models":
                 await self._handle_models(writer)
             elif method == "POST" and path == "/v1/chat/completions":
-                await self._handle_completions(writer, body_bytes, protocol="openai")
+                await self._handle_completions(
+                    writer, body_bytes, protocol="openai", headers=headers,
+                )
             elif method == "POST" and path == "/v1/messages":
-                await self._handle_completions(writer, body_bytes, protocol="anthropic")
+                await self._handle_completions(
+                    writer, body_bytes, protocol="anthropic", headers=headers,
+                )
             elif method == "OPTIONS":
                 await self._send_cors_preflight(writer)
             else:
@@ -199,7 +228,13 @@ class HTTPServer:
                 break
             if ":" in decoded:
                 key, value = decoded.split(":", 1)
-                headers[key.strip().lower()] = value.strip()
+                key = key.strip().lower()
+                # A repeated auth header name would collapse to last-wins in a
+                # plain dict — forge must never silently pick a credential
+                # winner, so flag it for the credential resolver to refuse.
+                if key in AUTH_HEADER_NAMES and key in headers:
+                    headers[DUPLICATE_AUTH_MARKER] = "1"
+                headers[key] = value.strip()
         return headers
 
     async def _handle_health(self, writer: asyncio.StreamWriter) -> None:
@@ -220,8 +255,10 @@ class HTTPServer:
         writer: asyncio.StreamWriter,
         body_bytes: bytes,
         protocol: str = "openai",
+        headers: dict[str, str] | None = None,
     ) -> None:
         """POST /v1/chat/completions (or /v1/messages) — the main proxy endpoint."""
+        headers = headers or {}
         try:
             body = json.loads(body_bytes)
         except json.JSONDecodeError:
@@ -240,9 +277,26 @@ class HTTPServer:
             protocol, is_stream, msg_count, tool_count, body.get("model", "?"),
         )
 
+        # Streaming responses flush a 200 + SSE header before the handler runs
+        # (so a queued client knows the connection is alive). Run the checks that
+        # must be able to fail with a real HTTP status — credential resolution
+        # and the first-request discovery probe — BEFORE that flush, so a bad/
+        # missing/duplicate credential returns 400/401 rather than 200 + an SSE
+        # error event. On success they latch, so the handler skips re-running
+        # discovery; its credential resolution is pure and repeats harmlessly.
+        # Non-streaming needs no pre-check — it never flushes early, so its
+        # errors already carry a real status.
+        if is_stream:
+            predispatch_error = await self._predispatch(protocol, headers)
+            if predispatch_error is not None:
+                await self._send_exception(
+                    writer, predispatch_error, protocol, as_stream=False,
+                )
+                return
+
         if self._serialize:
             # Queue the request and wait for the worker to process it
-            item = _QueueItem(body=body, protocol=protocol)
+            item = _QueueItem(body=body, protocol=protocol, headers=headers)
             queue_depth = self._queue.qsize()
             if queue_depth > 0:
                 logger.info("   Queued (depth=%d)", queue_depth + 1)
@@ -259,7 +313,7 @@ class HTTPServer:
         else:
             if is_stream:
                 await self._send_sse_header(writer)
-            result = await self._run_handler(body, protocol)
+            result = await self._run_handler(body, protocol, headers)
 
         if result is None:
             # Client disconnected
@@ -267,12 +321,7 @@ class HTTPServer:
             return
 
         if isinstance(result, Exception):
-            error_msg = str(result)
-            logger.info("<< ERROR: %s", error_msg[:120])
-            if is_stream:
-                await self._send_sse_body(writer, [{"error": error_msg}], protocol=protocol)
-            else:
-                await self._send_error(writer, 502, error_msg)
+            await self._send_exception(writer, result, protocol, as_stream=is_stream)
             return
 
         if is_stream:
@@ -281,6 +330,71 @@ class HTTPServer:
         else:
             logger.info("<< JSON 200")
             await self._send_json(writer, 200, json.dumps(result))
+
+    async def _predispatch(
+        self, protocol: str, headers: dict[str, str],
+    ) -> Exception | None:
+        """Pre-flush validation for a streaming request.
+
+        Resolves the inbound credential and runs first-request backend discovery
+        — the checks that must be able to fail with a real HTTP status — and
+        returns the Exception to surface, or None to proceed. Idempotent: the
+        handler re-resolves the (pure) credential and sees discovery latched, so
+        running this first changes nothing on the success path.
+        """
+        try:
+            extra_headers = resolve_inbound_credential(
+                headers,
+                source_protocol=protocol,
+                target_protocol=self._backend_protocol,
+                backend_api_key_present=self._backend_api_key_present,
+            )
+            await run_lazy_discovery(
+                self._client, self._context_manager, self._lazy_discovery, extra_headers,
+            )
+            return None
+        except Exception as exc:
+            return exc
+
+    async def _send_exception(
+        self,
+        writer: asyncio.StreamWriter,
+        exc: Exception,
+        protocol: str,
+        as_stream: bool,
+    ) -> None:
+        """Send an exception as the response.
+
+        ``as_stream`` True → an SSE error event (the 200 + SSE header was already
+        flushed, e.g. a backend fault mid-generation); False → a real HTTP error
+        status. Exception messages are safe to log/return by construction —
+        forge never authors a secret into one, and ``BackendError`` keeps the raw
+        backend body off its message (on ``exc.body`` instead).
+        """
+        error_msg = str(exc)
+        logger.info("<< ERROR: %s", error_msg[:120])
+        # Credential problems are client errors (two credentials / one colliding
+        # with --backend-api-key → 400, or none to an auth-required backend →
+        # 401), not backend failures. These messages carry only slot names.
+        if isinstance(exc, MultipleCredentialsError):
+            status = 400
+        elif isinstance(exc, MissingCredentialError):
+            status = 401
+        elif isinstance(exc, BackendDiscoveryError):
+            # Deferred discovery failed: a backend auth rejection is the caller's
+            # 401; any other cause (backend down, bad shape) is a 502.
+            status = 401 if exc.status_code in (401, 403) else 502
+        elif isinstance(exc, BackendError) and exc.status_code in (401, 403):
+            # A backend auth rejection during normal dispatch (a later zero-cred
+            # request to a gated backend, or a bad inbound key) is the caller's
+            # 401, not a forge/backend fault.
+            status = 401
+        else:
+            status = 502
+        if as_stream:
+            await self._send_sse_body(writer, [{"error": error_msg}], protocol=protocol)
+        else:
+            await self._send_error(writer, status, error_msg)
 
     async def _await_with_disconnect(
         self,
@@ -305,7 +419,10 @@ class HTTPServer:
         return item.future.result()
 
     async def _run_handler(
-        self, body: dict[str, Any], protocol: str = "openai",
+        self,
+        body: dict[str, Any],
+        protocol: str = "openai",
+        headers: dict[str, str] | None = None,
     ) -> dict[str, Any] | list[dict[str, Any]] | Exception:
         """Run the handler, catching errors."""
         try:
@@ -320,6 +437,10 @@ class HTTPServer:
                 inject_respond_tool=self._inject_respond_tool,
                 protocol=protocol,
                 reasoning_replay=self._reasoning_replay,
+                headers=headers,
+                backend_protocol=self._backend_protocol,
+                backend_api_key_present=self._backend_api_key_present,
+                lazy_discovery=self._lazy_discovery,
             )
         except Exception as exc:
             logger.exception("Handler error")
@@ -403,7 +524,11 @@ class HTTPServer:
             "HTTP/1.1 204 No Content\r\n"
             "Access-Control-Allow-Origin: *\r\n"
             "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+            # x-api-key is a first-class inbound credential slot (Anthropic-wire);
+            # browser clients must be allowed to preflight it. anthropic-version /
+            # anthropic-beta are standard Anthropic client headers.
+            "Access-Control-Allow-Headers: Content-Type, Authorization, X-Api-Key, "
+            "anthropic-version, anthropic-beta\r\n"
             "Connection: close\r\n"
             "\r\n"
         )
@@ -417,6 +542,7 @@ def _status_text(code: int) -> str:
         200: "OK",
         204: "No Content",
         400: "Bad Request",
+        401: "Unauthorized",
         404: "Not Found",
         413: "Payload Too Large",
         500: "Internal Server Error",
