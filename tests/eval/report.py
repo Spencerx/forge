@@ -109,6 +109,28 @@ _AR_SCENARIOS: set[str] = {
 # ── Data loading ────────────────────────────────────────────────
 
 
+# Reasoning-effort DISPLAY vocabulary, keyed by model stem. Maps a row's stored
+# reasoning_level ("default" = the model's registry baseline effort, plus any
+# explicit variant like "high") to the model's native vendor term. Only stems
+# present here render an effort tag; models with no chat-template reasoning knob
+# (qwen's reasoning is a server-side budget; plain instruct models) show nothing.
+# Storage stays generic ("default"/"high" in the JSONL); the bespoke terms live
+# here so display is decoupled from what's stored.
+_REASONING_VOCAB: dict[str, dict[str, str]] = {
+    "gpt-oss-120b-Q4_K_M": {"default": "medium", "high": "high"},
+    "NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q4_K_M": {"default": "low", "high": "high"},
+}
+
+
+def _reasoning_display(model: str, level: str) -> str | None:
+    """Native effort term for a model's reasoning_level, or None when the model
+    has no reasoning-effort axis (so no effort tag is shown)."""
+    vocab = _REASONING_VOCAB.get(model)
+    if vocab is None:
+        return None
+    return vocab.get(level, level)
+
+
 @dataclass
 class ConfigKey:
     model: str
@@ -118,6 +140,10 @@ class ConfigKey:
     tool_choice: str = "auto"
     # Pre-knob rows ran unbounded replay — legacy behavior == "full".
     reasoning_replay: str = "full"
+    # Reasoning-effort level. "default" = the model's registry baseline effort
+    # (pre-axis rows have no field); explicit variants like "high" coexist as
+    # parallel display rows. Rendered via _REASONING_VOCAB in _tag.
+    reasoning_level: str = "default"
 
     @property
     def _tag(self) -> str:
@@ -132,6 +158,9 @@ class ConfigKey:
             base = self.ablation
         if self.reasoning_replay != "none":
             base = f"{base}:{self.reasoning_replay}"
+        effort = _reasoning_display(self.model, self.reasoning_level)
+        if effort is not None:
+            base = f"{base}@{effort}"
         return f"[{base}]"
 
     @property
@@ -157,6 +186,7 @@ class ConfigKey:
         return hash((
             self.model, self.backend, self.mode,
             self.ablation, self.tool_choice, self.reasoning_replay,
+            self.reasoning_level,
         ))
 
     def __eq__(self, other: object) -> bool:
@@ -169,6 +199,7 @@ class ConfigKey:
             and self.ablation == other.ablation
             and self.tool_choice == other.tool_choice
             and self.reasoning_replay == other.reasoning_replay
+            and self.reasoning_level == other.reasoning_level
         )
 
 
@@ -196,15 +227,19 @@ def _row_replay(row: dict) -> str:
     return row.get("reasoning_replay", "full")
 
 
-def _config_tuple(row: dict) -> tuple[str, str, str, str, str]:
-    """The identity a config is deduped on — ConfigKey's fields minus reasoning_replay.
+def _config_tuple(row: dict) -> tuple[str, str, str, str, str, str]:
+    """The BASE identity a config is deduped on — ConfigKey's fields minus reasoning_replay.
 
-    reasoning_replay is deliberately NOT part of the dedup identity: pre-knob
-    rows have no field, and a newer-gen re-sweep should supersede them
-    regardless of which policies it ran (else every v0.7.0 row would survive
-    as a stale ':full' duplicate next to its re-swept config). Within one
-    generation all policy rows share the gen, so none/keep-last/full survive
-    dedup side by side as separate display rows (see group_rows).
+    reasoning_replay is not part of this base identity because pre-knob rows have
+    no field at all: they ran unbounded replay under the old default, and a
+    newer-gen re-sweep of the config should supersede them regardless of which
+    policies it ran (else every v0.7.0 row would survive as a stale ':full'
+    duplicate next to its re-swept config). See _policy_tuple for how rows that
+    DO carry an explicit policy are kept distinct.
+
+    reasoning_level, by contrast, IS part of the dedup identity: effort variants
+    of one stem (e.g. medium vs high) are parallel configs that must coexist,
+    not supersede each other. Pre-axis rows default to "default".
     """
     return (
         row["model"],
@@ -212,7 +247,17 @@ def _config_tuple(row: dict) -> tuple[str, str, str, str, str]:
         row["mode"],
         row.get("ablation", "reforged"),
         row.get("tool_choice", "auto"),
+        row.get("reasoning_level", "default"),
     )
+
+
+def _policy_tuple(row: dict) -> tuple:
+    """Base identity plus the row's EXPLICIT reasoning_replay policy.
+
+    Legacy pre-knob rows (no field) key on None, so they never collide with an
+    explicit policy arm. Used to scope supersession for explicit rows only.
+    """
+    return _config_tuple(row) + (row.get("reasoning_replay"),)
 
 
 def dedup_latest_gen(rows: list[dict]) -> list[dict]:
@@ -229,17 +274,43 @@ def dedup_latest_gen(rows: list[dict]) -> list[dict]:
     Rows with no ``gen`` field count as gen 0, so a lone legacy file with no
     generations renders exactly as before (everything at gen 0, no badges).
 
+    Supersession is scoped by whether a row carries an EXPLICIT reasoning_replay
+    policy, because the two cases mean different things:
+
+    * Legacy pre-knob rows (no field) are an artifact of the old unbounded-replay
+      default, not a deliberate measurement. Any newer-gen sweep of the config
+      supersedes them — scoped on the base identity — so they never linger as
+      phantom ':full' twins.
+    * Explicit policy rows (none/keep-last/full) are deliberate measurements of
+      that policy, so they are superseded only by a newer gen of the SAME policy
+      — scoped on the base identity plus the policy. An explicit arm that only
+      ever ran in an older gen carries forward with a badge rather than being
+      destroyed by a newer sweep that happened to run different policies.
+
     Note: dedup is whole-config, not per-scenario — a partial re-run would
     shadow the older gen's other scenarios. Not a concern today (re-swept
     configs are full-suite), but worth knowing before partial re-runs land.
     """
-    max_gen: dict[tuple, int] = {}
+    base_max: dict[tuple, int] = {}
+    policy_max: dict[tuple, int] = {}
     for r in rows:
-        k = _config_tuple(r)
         g = r.get("gen", 0)
-        if g > max_gen.get(k, -1):
-            max_gen[k] = g
-    return [r for r in rows if r.get("gen", 0) == max_gen[_config_tuple(r)]]
+        bk = _config_tuple(r)
+        pk = _policy_tuple(r)
+        if g > base_max.get(bk, -1):
+            base_max[bk] = g
+        if g > policy_max.get(pk, -1):
+            policy_max[pk] = g
+
+    kept: list[dict] = []
+    for r in rows:
+        g = r.get("gen", 0)
+        if "reasoning_replay" in r:
+            if g == policy_max[_policy_tuple(r)]:
+                kept.append(r)
+        elif g == base_max[_config_tuple(r)]:
+            kept.append(r)
+    return kept
 
 
 def group_rows(
@@ -254,7 +325,7 @@ def group_rows(
         tc = row.get("tool_choice", "auto")
         key = ConfigKey(
             row["model"], row["backend"], row["mode"], ablation, tc,
-            _row_replay(row),
+            _row_replay(row), row.get("reasoning_level", "default"),
         )
         grouped[key][row["scenario"]].append(row)
     return grouped
@@ -604,13 +675,23 @@ MODEL_FAMILIES: dict[str, dict[str, str]] = {
     "Qwen3.5-35B-A3B-Q4_K_M":               {"family": "qwen3.5-35b-a3b", "cross_backend_key": "qwen3.5-35b-a3b-q4_K_M"},
     "qwen3.5:27b-q4_K_M":                   {"family": "qwen3.5-27b", "cross_backend_key": "qwen3.5-27b-q4_K_M"},
     "qwen3.5:35b-a3b-q4_K_M":               {"family": "qwen3.5-35b-a3b", "cross_backend_key": "qwen3.5-35b-a3b-q4_K_M"},
+    "Qwen3.5-122B-A10B-Q4_K_M":             {"family": "qwen3.5-122b-a10b", "cross_backend_key": "qwen3.5-122b-a10b-q4_K_M"},
     # qwen3.6 (UD dropped from cross_backend_key — it's a quant variant, cf. gemma A4B UD)
     "Qwen3.6-27B-Q4_K_M":                   {"family": "qwen3.6-27b", "cross_backend_key": "qwen3.6-27b-q4_K_M"},
     "Qwen3.6-35B-A3B-UD-Q4_K_M":            {"family": "qwen3.6-35b-a3b", "cross_backend_key": "qwen3.6-35b-a3b-q4_K_M"},
     "qwen3.6:27b-q4_K_M":                   {"family": "qwen3.6-27b", "cross_backend_key": "qwen3.6-27b-q4_K_M"},
     "qwen3.6:35b-a3b-q4_K_M":               {"family": "qwen3.6-35b-a3b", "cross_backend_key": "qwen3.6-35b-a3b-q4_K_M"},
+    # lfm2.5 8b-a1b (llama-server only)
+    "LFM2.5-8B-A1B-Q4_K_M":                 {"family": "lfm2.5-8b-a1b", "cross_backend_key": "lfm2.5-8b-a1b-q4_K_M"},
+    # mellum2 12b-a2.5b (llama-server only; instruct + thinking share a family)
+    "Mellum2-12B-A2.5B-Instruct-Q4_K_M":    {"family": "mellum2-12b-a2.5b", "cross_backend_key": "mellum2-12b-a2.5b-instruct-q4_K_M"},
+    "Mellum2-12B-A2.5B-Thinking-Q4_K_M":    {"family": "mellum2-12b-a2.5b", "cross_backend_key": "mellum2-12b-a2.5b-thinking-q4_K_M"},
+    # gpt-oss 120b (llama-server only)
+    "gpt-oss-120b-Q4_K_M":                  {"family": "gpt-oss-120b", "cross_backend_key": "gpt-oss-120b-q4_K_M"},
     # nemotron 3 nano (30b a3b, llama-server only)
     "Nemotron-3-Nano-30B-A3B-Q4_K_M":       {"family": "nemotron-3-nano", "cross_backend_key": "nemotron-3-nano-30b-a3b-q4_K_M"},
+    # nemotron 3 super (120b a12b, llama-server only; UD is a quant variant)
+    "NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q4_K_M": {"family": "nemotron-3-super", "cross_backend_key": "nemotron-3-super-120b-a12b-q4_K_M"},
     # granite 4.0 (h-micro / h-tiny)
     "granite-4.0:h-micro-q4_K_M":           {"family": "granite-4.0-h-micro", "cross_backend_key": "granite-4.0-h-micro-q4_K_M"},
     "granite-4.0-h-micro-Q4_K_M":           {"family": "granite-4.0-h-micro", "cross_backend_key": "granite-4.0-h-micro-q4_K_M"},
