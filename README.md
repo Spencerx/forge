@@ -255,6 +255,9 @@ tool-calling workflows, with a baseline tier and an `advanced_reasoning` tier
 for top-end separation. See [Eval Guide](docs/EVAL_GUIDE.md) for the current
 scenario inventory and full CLI reference.
 
+The released run-level outcome corpus is available as the
+[Forge eval dataset on Hugging Face](https://huggingface.co/datasets/antoinezambelli/forge-evals).
+
 ```bash
 # llama-server (start in another terminal first; see Eval Guide)
 python -m tests.eval.eval_runner --backend llamafile --llamafile-mode prompt --gguf "path/to/Ministral-3-8B-Instruct-2512-Q8_0.gguf" --runs 10 --stream --verbose
@@ -329,7 +332,7 @@ tests/
 
 The forge guardrail framework and ablation study are published as:
 
-> Zambelli, A. *Forge: A Reliability Layer for Self-Hosted LLM Tool-Calling.*
+> Zambelli, A. *Forge: Closing the Agentic Reliability Gap Between Self-Hosted and Frontier Language Models.*
 > [https://doi.org/10.1145/3786335.3813193](https://doi.org/10.1145/3786335.3813193)
 
 A pre-publication preprint is also available at [docs/forge_ieee_preprint.pdf](docs/forge_ieee_preprint.pdf) — kept as a historical artifact. Cite the published version above; the DOI link may not resolve immediately depending on the publisher's release timing.
