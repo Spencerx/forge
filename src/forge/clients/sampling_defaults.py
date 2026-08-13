@@ -93,6 +93,9 @@ MODEL_SAMPLING_DEFAULTS: dict[str, dict[str, float | int]] = {
     "gemma-4-E4B-it-Q4_K_M":              {"temperature": 1.0, "top_p": 0.95, "top_k": 64},  # https://huggingface.co/google/gemma-4-e4b-it
     "gemma4:e4b-it-q8_0":                 {"temperature": 1.0, "top_p": 0.95, "top_k": 64},  # https://huggingface.co/google/gemma-4-e4b-it
     "gemma-4-E4B-it-Q8_0":                {"temperature": 1.0, "top_p": 0.95, "top_k": 64},  # https://huggingface.co/google/gemma-4-e4b-it
+    # Muse Glimmer 30B — card recommends one sampling profile; min_p and
+    # repetition/presence penalties are not specified and remain unset.
+    "Muse-Glimmer-30B-UD-Q4_K_XL":       {"temperature": 1.0, "top_p": 0.95, "top_k": 64},  # https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF
     # Mistral Small 4 — card gives T=0.7 for reasoning_effort="high" and "between 0.0 and 0.7" for
     # reasoning_effort="none" (task-dependent). Picking the high-effort profile (T=0.7 + explicit
     # reasoning_effort="high" via chat_template_kwargs envelope) as the safer default. top_p/top_k
@@ -105,10 +108,18 @@ MODEL_SAMPLING_DEFAULTS: dict[str, dict[str, float | int]] = {
     # smoke clean. enable_thinking left as template default (true server-side
     # but reasoning-budget=0 caps it to 0 tokens).
     "Qwen3.5-122B-A10B-Q4_K_M":             {"temperature": 0.7, "top_p": 0.8, "top_k": 20},                                                                 # https://huggingface.co/Qwen/Qwen3.5-122B-A10B
+    # DeepSeek-V4-Flash-0731 — agentic profile: T=1.0, top_p=0.95. The card
+    # supports low/high/max reasoning effort. This one registry value is the
+    # deliberate campaign selector; change only it between effort campaigns.
+    "DeepSeek-V4-Flash-0731-UD-Q4_K_XL":      {"temperature": 1.0, "top_p": 0.95, "chat_template_kwargs": {"reasoning_effort": "low"}},                  # https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731
+    # Inkling-Small — Unsloth recommends T=1.0/top_p=1.0 for most tasks and
+    # includes min_p=0.0 in its llama.cpp recipes. Use high effort (0.9) for
+    # the DGE pressure smoke; xhigh/max both map to the benchmark's 0.99.
+    "Inkling-Small-UD-IQ4_XS":                 {"temperature": 1.0, "top_p": 1.0, "min_p": 0.0, "chat_template_kwargs": {"reasoning_effort": "high"}},   # https://unsloth.ai/docs/models/inkling
     # gpt-oss-120b — OpenAI open-weight MoE (117B total, 5.1B active). Reasoning model with three
     # discrete levels: "low" / "medium" / "high", controlled via chat_template_kwargs.reasoning_effort
-    # (per llama.cpp guide: `--chat-template-kwargs '{"reasoning_effort": "high"}'`). Defaulting to
-    # "high" — bring down if overthinking observed. Card says T=1.0, top_p=1.0; llama.cpp guide adds
+    # (per llama.cpp guide: `--chat-template-kwargs '{"reasoning_effort": "high"}'`). The registry
+    # baseline is medium. Card says T=1.0, top_p=1.0; llama.cpp guide adds
     # top_k=0, min_p=0.0 (OpenAI's stated default; llama.cpp maintainer notes top_k=0 may add CPU
     # overhead but we're GPU). CRITICAL: do NOT set repeat_penalty/presence_penalty (guide explicitly
     # warns to disable repetition penalties) — registry omission == None == field omitted from body.
@@ -116,8 +127,7 @@ MODEL_SAMPLING_DEFAULTS: dict[str, dict[str, float | int]] = {
     "gpt-oss-120b-Q4_K_M":  {"temperature": 1.0, "top_p": 1.0, "top_k": 0, "min_p": 0.0, "chat_template_kwargs": {"reasoning_effort": "medium"}},  # https://huggingface.co/openai/gpt-oss-120b + https://github.com/ggml-org/llama.cpp/discussions/15396
     # NVIDIA Nemotron-3-Super-120B-A12B — hybrid Mamba-2 + Transformer + MoE. Reasoning model with
     # three states via chat_template_kwargs.enable_thinking: True (full default), True+low_effort
-    # for lighter think, or False (off). Defaulting to enable_thinking=True (no low_effort) for full
-    # effort, mirroring Mistral-Small-4 decision; bring down if overthinking. Card recommends
+    # for lighter think, or False (off). The registry baseline uses low effort. Card recommends
     # T=1.0, top_p=0.95 across all tasks. Coding-agent serving guidance also adds force_nonempty_content
     # so the model emits something substantive instead of empty <think> blocks. Native tool format is
     # Qwen3-coder-style (vLLM uses --tool-call-parser qwen3_coder); should work fine through forge's

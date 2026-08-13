@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -68,12 +69,11 @@ def _anthropic_config() -> BatchConfig:
 
 
 def _install_inert_backend(monkeypatch: pytest.MonkeyPatch) -> None:
-    class FakeServerManager:
-        def __init__(self, *args, **kwargs):
-            pass
+    class FakeServer:
+        client_base_url = "http://localhost:11434"
 
-        async def start_with_budget(self, **kwargs):
-            return 4096
+        async def restart(self):
+            pass
 
         async def resolve_budget(self, *args, **kwargs):
             return 4096
@@ -81,12 +81,15 @@ def _install_inert_backend(monkeypatch: pytest.MonkeyPatch) -> None:
         async def stop(self):
             pass
 
+    async def fake_setup_backend(**kwargs):
+        return FakeServer(), SimpleNamespace(budget_tokens=4096)
+
     monkeypatch.setattr(batch_eval, "ALL_SCENARIOS", [basic_2step])
     monkeypatch.setattr(batch_eval, "_check_model_available", lambda *args: None)
-    monkeypatch.setattr(batch_eval, "ServerManager", FakeServerManager)
+    monkeypatch.setattr(batch_eval, "setup_backend", fake_setup_backend)
     monkeypatch.setattr(batch_eval, "_build_client", lambda *args: object())
 
-    async def fake_run_with_timeout(client, scenario, eval_config, ablation):
+    async def fake_run_with_timeout(client, scenario, eval_config, ablation, run_timeout):
         return _result(scenario.name)
 
     monkeypatch.setattr(batch_eval, "_run_with_timeout", fake_run_with_timeout)
@@ -94,9 +97,9 @@ def _install_inert_backend(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _fail_if_backend_reached(monkeypatch: pytest.MonkeyPatch) -> None:
     def fail(*args, **kwargs):
-        pytest.fail("backend construction was reached before generation preflight")
+        pytest.fail("backend construction was reached")
 
-    monkeypatch.setattr(batch_eval, "ServerManager", fail)
+    monkeypatch.setattr(batch_eval, "setup_backend", fail)
     monkeypatch.setattr(batch_eval, "_build_client", fail)
 
 
@@ -146,24 +149,27 @@ def test_run_result_to_row_requires_generation_keyword() -> None:
 
 
 @pytest.mark.asyncio
-async def test_anthropic_append_records_nonzero_generation(
+async def test_mixed_managed_and_anthropic_configs_fail_before_preflight_or_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     output = tmp_path / "results.jsonl"
-    _install_inert_backend(monkeypatch)
-
-    await run_batch(
-        configs=[_anthropic_config()],
-        runs_per_scenario=1,
-        output_path=output,
-        reasoning_replay="none",
-        generation=4,
+    _fail_if_backend_reached(monkeypatch)
+    monkeypatch.setattr(
+        batch_eval,
+        "_preflight_recorded_runs",
+        lambda *args, **kwargs: pytest.fail("result preflight was reached"),
     )
 
-    row = json.loads(output.read_text(encoding="utf-8"))
-    assert row["backend"] == "anthropic"
-    assert row["gen"] == 4
-    assert row["reasoning_replay"] == "none"
+    with pytest.raises(ValueError, match="managed backends.*anthropic"):
+        await run_batch(
+            configs=[_managed_config(), _anthropic_config()],
+            runs_per_scenario=1,
+            output_path=output,
+            reasoning_replay="none",
+            generation=4,
+        )
+
+    assert not output.exists()
 
 
 @pytest.mark.asyncio
@@ -174,7 +180,7 @@ async def test_new_output_defaults_to_generation_zero(
     _install_inert_backend(monkeypatch)
 
     await run_batch(
-        configs=[_anthropic_config()], runs_per_scenario=1, output_path=output
+        configs=[_managed_config()], runs_per_scenario=1, output_path=output
     )
 
     assert json.loads(output.read_text(encoding="utf-8"))["gen"] == 0
@@ -208,7 +214,7 @@ async def test_empty_output_accepts_requested_generation(
     _install_inert_backend(monkeypatch)
 
     await run_batch(
-        configs=[_anthropic_config()], runs_per_scenario=1,
+        configs=[_managed_config()], runs_per_scenario=1,
         output_path=output, generation=6,
     )
 
@@ -216,17 +222,55 @@ async def test_empty_output_accepts_requested_generation(
 
 
 @pytest.mark.asyncio
+async def test_public_setup_receives_the_configuration_recipe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recipe_flags = ("--reasoning-format", "auto", "--no-mmap")
+    setups: list[dict[str, Any]] = []
+
+    _install_inert_backend(monkeypatch)
+
+    class Server:
+        client_base_url = "http://localhost:8080/v1"
+
+        async def stop(self):
+            pass
+
+    async def setup(**kwargs):
+        setups.append(kwargs)
+        return Server(), SimpleNamespace(budget_tokens=4096)
+
+    monkeypatch.setattr(batch_eval, "setup_backend", setup)
+    config = BatchConfig(
+        model="M",
+        backend="llamaserver",
+        mode="native",
+        think=None,
+        gguf_filename="M.gguf",
+        server_recipe=batch_eval._BatchServerRecipe(recipe_flags),
+    )
+
+    await run_batch(
+        configs=[config],
+        runs_per_scenario=1,
+        output_path=tmp_path / "results.jsonl",
+    )
+
+    assert setups[0]["extra_flags"] == list(recipe_flags)
+
+
+@pytest.mark.asyncio
 async def test_same_generation_resume_uses_exact_next_run_number(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     output = tmp_path / "results.jsonl"
-    first = _row(model="claude-sonnet-4-6", generation=3, run_idx=1)
-    first["backend"] = "anthropic"
+    first = _row(generation=3, run_idx=1)
+    first["backend"] = "ollama"
     _write_rows(output, [first])
     _install_inert_backend(monkeypatch)
 
     await run_batch(
-        configs=[_anthropic_config()], runs_per_scenario=2,
+        configs=[_managed_config()], runs_per_scenario=2,
         output_path=output, reasoning_replay="none", generation=3,
     )
 
@@ -235,15 +279,13 @@ async def test_same_generation_resume_uses_exact_next_run_number(
     assert {row["gen"] for row in rows} == {3}
 
 
-@pytest.mark.parametrize("backend_path", ["anthropic", "managed"])
 @pytest.mark.asyncio
 async def test_resume_safely_separates_unterminated_final_row(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    backend_path: str,
 ) -> None:
     output = tmp_path / "results.jsonl"
-    config = _anthropic_config() if backend_path == "anthropic" else _managed_config()
+    config = _managed_config()
     first = _row(model=config.model, generation=4, run_idx=1)
     first["backend"] = config.backend
     first["mode"] = config.mode
@@ -292,11 +334,10 @@ async def test_legacy_full_resume_skips_existing_generation_zero_run(
 ) -> None:
     output = tmp_path / "legacy.jsonl"
     legacy = _row(
-        model="claude-sonnet-4-6",
         reasoning_replay="full",
         outcome_dialect=LEGACY_DIALECT,
     )
-    legacy["backend"] = "anthropic"
+    legacy["backend"] = "ollama"
     del legacy["reasoning_replay"]
     del legacy["gen"]
     _write_rows(output, [legacy])
@@ -304,7 +345,7 @@ async def test_legacy_full_resume_skips_existing_generation_zero_run(
     _install_inert_backend(monkeypatch)
 
     await run_batch(
-        configs=[_anthropic_config()], runs_per_scenario=1,
+        configs=[_managed_config()], runs_per_scenario=1,
         output_path=output, reasoning_replay="full", generation=0,
     )
 
@@ -316,17 +357,15 @@ async def test_explicit_none_does_not_collide_with_legacy_full(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     output = tmp_path / "legacy.jsonl"
-    legacy = _row(
-        model="claude-sonnet-4-6", outcome_dialect=LEGACY_DIALECT
-    )
-    legacy["backend"] = "anthropic"
+    legacy = _row(outcome_dialect=LEGACY_DIALECT)
+    legacy["backend"] = "ollama"
     del legacy["reasoning_replay"]
     del legacy["gen"]
     _write_rows(output, [legacy])
     _install_inert_backend(monkeypatch)
 
     await run_batch(
-        configs=[_anthropic_config()], runs_per_scenario=1,
+        configs=[_managed_config()], runs_per_scenario=1,
         output_path=output, reasoning_replay="none", generation=0,
     )
 

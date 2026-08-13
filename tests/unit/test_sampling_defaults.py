@@ -53,6 +53,25 @@ class TestGetSamplingDefaults:
         assert "min_p" not in result
         assert "presence_penalty" not in result
 
+    def test_deepseek_v4_0731_uses_one_supported_registry_effort(self) -> None:
+        """The registry row is the sole low/high/max campaign selector."""
+        result = get_sampling_defaults("DeepSeek-V4-Flash-0731-UD-Q4_K_XL")
+        assert result["temperature"] == 1.0
+        assert result["top_p"] == 0.95
+        assert result["chat_template_kwargs"]["reasoning_effort"] in {
+            "low", "high", "max",
+        }
+
+    def test_inkling_small_uses_recommended_sampling_and_high_effort(self) -> None:
+        """Inkling uses Unsloth's sampling profile and the smoke's high effort."""
+        result = get_sampling_defaults("Inkling-Small-UD-IQ4_XS")
+        assert result == {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "min_p": 0.0,
+            "chat_template_kwargs": {"reasoning_effort": "high"},
+        }
+
     def test_get_does_not_log_for_unknown_model(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:

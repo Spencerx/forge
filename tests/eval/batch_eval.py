@@ -14,16 +14,23 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from forge.clients.sampling_defaults import get_sampling_defaults
 from forge.core.reasoning import DEFAULT_REASONING_REPLAY, REASONING_REPLAY_CHOICES, ReasoningReplay
-from forge.server import BudgetMode, ServerManager
+from forge.rpc import (
+    LlamaCppRpcConfig,
+    LlamaCppRpcWorkerConfig,
+    render_rpc_coordinator_args,
+    render_rpc_worker_command,
+)
+from forge.server import BudgetMode, ServerManager, setup_backend
 
 from tests.eval.ablation import ABLATION_PRESETS, AblationConfig
 from tests.eval.eval_runner import EvalConfig, RunResult, run_scenario
@@ -49,47 +56,113 @@ def _eval_port() -> int:
     """llama-server port for eval workers; overridden by rig wrappers."""
     return int(os.environ.get("FORGE_EVAL_PORT", "8080"))
 
-# GGUF and llamafile model files for local-server backends.
-# Each entry is just the filename — paired into a BatchConfig below
-# alongside the canonical identity (the file stem, no extension).
-_GGUF_FILES: list[str] = [
-    "Qwen3-8B-Q4_K_M.gguf",
-    "Qwen3-8B-Q8_0.gguf",
-    "Qwen3-14B-Q4_K_M.gguf",
-    "Ministral-3-8B-Instruct-2512-Q4_K_M.gguf",
-    "Ministral-3-8B-Instruct-2512-Q8_0.gguf",
-    "Ministral-3-14B-Instruct-2512-Q4_K_M.gguf",
-    "Ministral-3-8B-Reasoning-2512-Q4_K_M.gguf",
-    "Ministral-3-8B-Reasoning-2512-Q8_0.gguf",
-    "Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf",
-    "gemma-4-E4B-it-Q4_K_M.gguf",
-    "gemma-4-E4B-it-Q8_0.gguf",
-    "granite-4.1-8b-Q4_K_M.gguf",
-    "granite-4.1-8b-Q8_0.gguf",
-    "phi-4-Q4_K_M.gguf",
+@dataclass(frozen=True)
+class _BatchServerRecipe:
+    """Literal server options owned by one managed batch configuration."""
+
+    extra_flags: tuple[str, ...] = ()
+    rpc: LlamaCppRpcConfig | None = None
+    draft_filename: str | None = None
+
+
+_DEFAULT_SERVER_RECIPE = _BatchServerRecipe()
+_REASONING_SERVER_RECIPE = _BatchServerRecipe(("--reasoning-format", "auto"))
+_GEMMA4_LARGE_SERVER_RECIPE = _BatchServerRecipe((
+    "--reasoning-format", "auto",
+    "--ctx-checkpoints", "1", "--cache-type-k", "q8_0",
+    "--cache-type-v", "q8_0", "-fa", "1",
+    "--samplers", "temperature;top_p;top_k",
+))
+_GPT_OSS_120B_SERVER_RECIPE = _BatchServerRecipe((
+    "--reasoning-format", "auto",
+    "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "-fa", "1",
+    "-ub", "2048", "-b", "2048",
+    "--no-prefill-assistant", "--no-mmap",
+))
+_LARGE_120B_SERVER_RECIPE = _BatchServerRecipe((
+    "--reasoning-format", "auto",
+    "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "-fa", "1",
+    "--no-prefill-assistant", "--no-mmap",
+))
+_GLIMMER_SERVER_RECIPE = _BatchServerRecipe(
+    extra_flags=(
+        "--reasoning", "on", "--reasoning-format", "auto",
+        "--chat-template-kwargs", '{"reasoning_strength":"xhigh"}',
+        "--ctx-checkpoints", "1", "--cache-type-k", "q8_0",
+        "--cache-type-v", "q8_0", "-fa", "1",
+        "--samplers", "temperature;top_p;top_k",
+        "--spec-type", "draft-dflash", "--device-draft", "CUDA0",
+        "--gpu-layers-draft", "all", "--spec-draft-n-max", "15",
+    ),
+    draft_filename="dflash-kquant.gguf",
+)
+_DEEPSEEK_V4_RPC_SERVER_RECIPE = _BatchServerRecipe((
+    "--fit", "off",
+    "-b", "2048", "-ub", "128",
+    "--cache-type-k", "q8_0", "--cache-type-v", "q8_0",
+    "--no-mmap", "-fa", "on",
+    "--reasoning-budget", "32768", "--reasoning-format", "auto",
+    "--no-prefill-assistant",
+))
+
+_DEEPSEEK_V4_MODEL = "DeepSeek-V4-Flash-0731-UD-Q4_K_XL"
+_DEEPSEEK_V4_GGUF = f"{_DEEPSEEK_V4_MODEL}-00001-of-00005.gguf"
+_DEEPSEEK_V4_SAMPLING: dict[str, Any] = get_sampling_defaults(_DEEPSEEK_V4_MODEL)
+_DEEPSEEK_V4_REASONING_LEVEL: str = _DEEPSEEK_V4_SAMPLING[
+    "chat_template_kwargs"
+]["reasoning_effort"]
+
+# Effective reasoning levels for model configurations with an explicitly
+# controlled effort axis.  "default" remains reserved for configurations that
+# do not record a tested effort level; it is also the fallback for legacy rows
+# written before the field existed.
+_EFFECTIVE_REASONING_LEVELS: dict[str, str] = {
+    "gpt-oss-120b-Q4_K_M": "medium",
+    "NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q4_K_M": "low",
+    "Muse-Glimmer-30B-UD-Q4_K_XL": "xhigh",
+}
+
+
+# GGUF files and their literal per-configuration server options. Mode-derived
+# options such as --jinja remain owned by ServerManager.
+_GGUF_FILES: list[tuple[str, _BatchServerRecipe]] = [
+    ("Qwen3-8B-Q4_K_M.gguf", _REASONING_SERVER_RECIPE),
+    ("Qwen3-8B-Q8_0.gguf", _REASONING_SERVER_RECIPE),
+    ("Qwen3-14B-Q4_K_M.gguf", _REASONING_SERVER_RECIPE),
+    ("Ministral-3-8B-Instruct-2512-Q4_K_M.gguf", _DEFAULT_SERVER_RECIPE),
+    ("Ministral-3-8B-Instruct-2512-Q8_0.gguf", _DEFAULT_SERVER_RECIPE),
+    ("Ministral-3-14B-Instruct-2512-Q4_K_M.gguf", _DEFAULT_SERVER_RECIPE),
+    ("Ministral-3-8B-Reasoning-2512-Q4_K_M.gguf", _DEFAULT_SERVER_RECIPE),
+    ("Ministral-3-8B-Reasoning-2512-Q8_0.gguf", _DEFAULT_SERVER_RECIPE),
+    ("Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf", _DEFAULT_SERVER_RECIPE),
+    ("gemma-4-E4B-it-Q4_K_M.gguf", _DEFAULT_SERVER_RECIPE),
+    ("gemma-4-E4B-it-Q8_0.gguf", _DEFAULT_SERVER_RECIPE),
+    ("granite-4.1-8b-Q4_K_M.gguf", _DEFAULT_SERVER_RECIPE),
+    ("granite-4.1-8b-Q8_0.gguf", _DEFAULT_SERVER_RECIPE),
+    ("phi-4-Q4_K_M.gguf", _DEFAULT_SERVER_RECIPE),
     # 32GB tier (rig-02 v0.7.1 eval — the configs that ran)
-    "Mistral-Small-3.2-24B-Instruct-2506-Q4_K_M.gguf",
-    "Qwen3.5-27B-Q4_K_M.gguf",
-    "Qwen3.5-35B-A3B-Q4_K_M.gguf",
-    "Qwen3.6-27B-Q4_K_M.gguf",
-    "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
-    "Nemotron-3-Nano-30B-A3B-Q4_K_M.gguf",
+    ("Mistral-Small-3.2-24B-Instruct-2506-Q4_K_M.gguf", _DEFAULT_SERVER_RECIPE),
+    ("Qwen3.5-27B-Q4_K_M.gguf", _REASONING_SERVER_RECIPE),
+    ("Qwen3.5-35B-A3B-Q4_K_M.gguf", _REASONING_SERVER_RECIPE),
+    ("Qwen3.6-27B-Q4_K_M.gguf", _REASONING_SERVER_RECIPE),
+    ("Qwen3.6-35B-A3B-UD-Q4_K_M.gguf", _REASONING_SERVER_RECIPE),
+    ("Nemotron-3-Nano-30B-A3B-Q4_K_M.gguf", _REASONING_SERVER_RECIPE),
+    ("Muse-Glimmer-30B-UD-Q4_K_XL.gguf", _GLIMMER_SERVER_RECIPE),
     # Gemma-4 large (rig-04, az/eval-large): 26B-A4B MoE + 31B dense. Native FC;
-    # serving recipe in _SERVER_EXTRA_FLAGS (SWA + q8-KV serving fixes).
-    "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
-    "gemma-4-31B-it-Q4_K_M.gguf",
+    # literal serving recipe includes the SWA + q8-KV serving fixes.
+    ("gemma-4-26B-A4B-it-UD-Q4_K_M.gguf", _GEMMA4_LARGE_SERVER_RECIPE),
+    ("gemma-4-31B-it-Q4_K_M.gguf", _GEMMA4_LARGE_SERVER_RECIPE),
     # 120B tier (rig-03, az/eval-large): multi-shard GGUFs — list the FIRST
     # shard; llama-server auto-loads siblings. The config loop strips the
-    # -NNNNN-of-NNNNN suffix so the model key (and _SERVER_EXTRA_FLAGS /
-    # sampling lookups) resolve on the clean stem. Serving recipe below.
-    "gpt-oss-120b-Q4_K_M-00001-of-00002.gguf",
-    "Qwen3.5-122B-A10B-Q4_K_M-00001-of-00003.gguf",
-    "NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q4_K_M-00001-of-00003.gguf",
+    # -NNNNN-of-NNNNN suffix for clean model identity and sampling lookups.
+    ("gpt-oss-120b-Q4_K_M-00001-of-00002.gguf", _GPT_OSS_120B_SERVER_RECIPE),
+    ("Qwen3.5-122B-A10B-Q4_K_M-00001-of-00003.gguf", _LARGE_120B_SERVER_RECIPE),
+    ("NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q4_K_M-00001-of-00003.gguf", _LARGE_120B_SERVER_RECIPE),
     # 16GB tier (rig-01) — LFM2.5 MoE + Mellum2 MoE (both variants). All
     # support native FC, so each gets native + prompt configs below.
-    "LFM2.5-8B-A1B-Q4_K_M.gguf",
-    "Mellum2-12B-A2.5B-Thinking-Q4_K_M.gguf",
-    "Mellum2-12B-A2.5B-Instruct-Q4_K_M.gguf",
+    ("LFM2.5-8B-A1B-Q4_K_M.gguf", _REASONING_SERVER_RECIPE),
+    ("Mellum2-12B-A2.5B-Thinking-Q4_K_M.gguf", _REASONING_SERVER_RECIPE),
+    ("Mellum2-12B-A2.5B-Instruct-Q4_K_M.gguf", _DEFAULT_SERVER_RECIPE),
 ]
 
 # Models that lack native function-calling support — only run prompt mode.
@@ -126,25 +199,25 @@ class BatchConfig:
       - ollama: Ollama-style string (e.g. "qwen3:8b-q8_0")
       - llamaserver: GGUF stem (e.g. "Qwen3-8B-Q8_0")
       - llamafile: llamafile binary stem (e.g. "Mistral-Nemo-Instruct-2407.Q4_K_M")
-      - anthropic: model ID (e.g. "claude-haiku-4-5-20251001")
 
     ``gguf_filename`` is the on-disk filename for llamaserver/llamafile
     backends (joined with ``models_dir`` to form the path passed to the
-    server and to ``LlamafileClient(gguf_path=...)``). None for
-    ollama/anthropic.
+    server and to ``LlamafileClient(gguf_path=...)``). None for ollama.
     """
 
     model: str
-    backend: str  # "ollama" | "llamaserver" | "llamafile" | "anthropic"
+    backend: str  # "ollama" | "llamaserver" | "llamafile"
     mode: str  # "native" | "prompt"
     think: bool | None  # None = auto
-    tool_choice: str | None = None  # Anthropic only: "auto", "any"
+    tool_choice: str | None = None
     gguf_filename: str | None = None  # llamaserver/llamafile only
-    # Reasoning-effort axis. reasoning_level tags rows so effort variants of the
-    # same stem coexist in the resume key + report ("default" = registry
-    # recommended sampling). sampling_override, when set, bypasses recommended
-    # sampling in _build_client and passes an explicit param set (its keys match
-    # LlamafileClient kwargs). See forge_eval_reasoning_level_axis design.
+    server_recipe: _BatchServerRecipe = _DEFAULT_SERVER_RECIPE
+    # Reasoning-effort axis. reasoning_level records the effective tested level
+    # so variants of the same stem coexist in the resume key + report. "default"
+    # means no explicit level was recorded (and is the legacy missing-field
+    # fallback), not "look up the current registry value". sampling_override,
+    # when set, bypasses recommended sampling in _build_client and passes an
+    # explicit param set (its keys match LlamafileClient kwargs).
     reasoning_level: str = "default"
     sampling_override: dict[str, Any] | None = None
 
@@ -169,7 +242,7 @@ OLLAMA_CONFIGS: list[BatchConfig] = [
 # llama-server configs: each GGUF × 2 modes (native + prompt), with native
 # skipped for models in _PROMPT_ONLY_MODELS (no native FC training).
 LLAMASERVER_CONFIGS: list[BatchConfig] = []
-for _filename in _GGUF_FILES:
+for _filename, _server_recipe in _GGUF_FILES:
     # Strip a multi-shard suffix (e.g. "-00001-of-00002") so a sharded model
     # keys on its clean stem for config/flags/sampling/row-identity, while
     # gguf_filename keeps the first-shard name that llama-server loads from.
@@ -179,12 +252,16 @@ for _filename in _GGUF_FILES:
             BatchConfig(
                 model=_stem, backend="llamaserver", mode="native",
                 think=None, gguf_filename=_filename,
+                server_recipe=_server_recipe,
+                reasoning_level=_EFFECTIVE_REASONING_LEVELS.get(_stem, "default"),
             )
         )
     LLAMASERVER_CONFIGS.append(
         BatchConfig(
             model=_stem, backend="llamaserver", mode="prompt",
             think=None, gguf_filename=_filename,
+            server_recipe=_server_recipe,
+            reasoning_level=_EFFECTIVE_REASONING_LEVELS.get(_stem, "default"),
         )
     )
 
@@ -195,22 +272,6 @@ LLAMAFILE_CONFIGS: list[BatchConfig] = [
         think=None, gguf_filename=filename,
     )
     for filename in _LLAMAFILE_FILES
-]
-
-ANTHROPIC_CONFIGS: list[BatchConfig] = [
-    # think=True -> adaptive extended thinking ("Claude with reasoning" baseline
-    # rows). Haiku has no adaptive support (API rejects it) so it stays a
-    # non-thinking baseline. Wired in _build_client. NOT part of the
-    # reasoning_replay sweep — thinking here is request-only, no replay folding.
-    BatchConfig(model="claude-haiku-4-5-20251001", backend="anthropic", mode="native", think=False),
-    BatchConfig(model="claude-sonnet-4-6", backend="anthropic", mode="native", think=True),
-    BatchConfig(model="claude-opus-4-8", backend="anthropic", mode="native", think=True),
-]
-
-ANTHROPIC_ANY_CONFIGS: list[BatchConfig] = [
-    BatchConfig(model="claude-haiku-4-5-20251001", backend="anthropic", mode="native", think=None, tool_choice="any"),
-    BatchConfig(model="claude-sonnet-4-6", backend="anthropic", mode="native", think=None, tool_choice="any"),
-    BatchConfig(model="claude-opus-4-8", backend="anthropic", mode="native", think=None, tool_choice="any"),
 ]
 
 ALL_CONFIGS: list[BatchConfig] = (
@@ -233,13 +294,15 @@ NEW_MODEL_CONFIGS: list[BatchConfig] = [
 # recommended sampling is bypassed (sampling_override) so chat_template_kwargs
 # swaps the effort knob to HIGH while get_sampling_defaults preserves the rest
 # of the registry baseline (temp/top_p/...). reasoning_level="high" tags the
-# rows so they coexist with the baseline ("default") rows in the resume key +
-# report instead of colliding (silent-skip). Kept OUT of LLAMASERVER_CONFIGS /
-# "all" so only an explicit --config reasoning-high runs them.
+# rows so they coexist with the explicitly stamped baseline rows in the resume
+# key + report instead of colliding (silent-skip). Kept OUT of
+# LLAMASERVER_CONFIGS / "all" so only an explicit --config reasoning-high runs
+# them.
 _REASONING_HIGH_CONFIGS: list[BatchConfig] = [
     BatchConfig(
         model="gpt-oss-120b-Q4_K_M", backend="llamaserver", mode="native",
         think=None, gguf_filename="gpt-oss-120b-Q4_K_M-00001-of-00002.gguf",
+        server_recipe=_GPT_OSS_120B_SERVER_RECIPE,
         reasoning_level="high",
         sampling_override={
             **get_sampling_defaults("gpt-oss-120b-Q4_K_M"),
@@ -250,6 +313,7 @@ _REASONING_HIGH_CONFIGS: list[BatchConfig] = [
         model="NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q4_K_M", backend="llamaserver",
         mode="native", think=None,
         gguf_filename="NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q4_K_M-00001-of-00003.gguf",
+        server_recipe=_LARGE_120B_SERVER_RECIPE,
         reasoning_level="high",
         sampling_override={
             **get_sampling_defaults("NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q4_K_M"),
@@ -260,8 +324,22 @@ _REASONING_HIGH_CONFIGS: list[BatchConfig] = [
     ),
 ]
 
+# Explicit large-model campaign. Machine-local RPC values are attached from
+# --rpc-topology at invocation time; reasoning effort comes only from the
+# sampling-registry row for this model.
+DEEPSEEK_V4_RPC_CONFIGS: list[BatchConfig] = [
+    BatchConfig(
+        model=_DEEPSEEK_V4_MODEL,
+        backend="llamaserver",
+        mode="native",
+        think=None,
+        gguf_filename=_DEEPSEEK_V4_GGUF,
+        server_recipe=_DEEPSEEK_V4_RPC_SERVER_RECIPE,
+        reasoning_level=_DEEPSEEK_V4_REASONING_LEVEL,
+    ),
+]
+
 # Named subsets for quick iteration
-# Note: "anthropic" is separate from "all" — it costs money per API call.
 CONFIG_SETS: dict[str, list[BatchConfig]] = {
     "all": ALL_CONFIGS,
     "ollama": OLLAMA_CONFIGS,
@@ -270,18 +348,105 @@ CONFIG_SETS: dict[str, list[BatchConfig]] = {
     "llamaserver-native": [c for c in LLAMASERVER_CONFIGS if c.mode == "native"],
     "llamaserver-prompt": [c for c in LLAMASERVER_CONFIGS if c.mode == "prompt"],
     "reasoning-high": _REASONING_HIGH_CONFIGS,
+    "deepseek-v4-rpc": DEEPSEEK_V4_RPC_CONFIGS,
     "new-models": NEW_MODEL_CONFIGS,
     "new-models-native": [c for c in NEW_MODEL_CONFIGS if c.mode == "native"],
     "new-models-prompt": [c for c in NEW_MODEL_CONFIGS if c.mode == "prompt"],
-    "anthropic": ANTHROPIC_CONFIGS,
-    "anthropic-any": ANTHROPIC_ANY_CONFIGS,
-    "haiku": [c for c in ANTHROPIC_CONFIGS if "haiku" in c.model],
-    "sonnet": [c for c in ANTHROPIC_CONFIGS if "sonnet" in c.model],
-    "opus": [c for c in ANTHROPIC_CONFIGS if "opus" in c.model],
-    "haiku-any": [c for c in ANTHROPIC_ANY_CONFIGS if "haiku" in c.model],
-    "sonnet-any": [c for c in ANTHROPIC_ANY_CONFIGS if "sonnet" in c.model],
-    "opus-any": [c for c in ANTHROPIC_ANY_CONFIGS if "opus" in c.model],
 }
+
+
+def _load_rpc_topology(path: Path) -> LlamaCppRpcConfig:
+    """Load one explicit batch RPC topology from a small JSON file."""
+    topology_data = dict(json.loads(path.read_text(encoding="utf-8")))
+    worker_data = dict(topology_data.pop("worker"))
+    if "environment" in worker_data:
+        worker_data["environment"] = tuple(
+            tuple(pair) for pair in worker_data["environment"]
+        )
+    if "ssh_options" in worker_data:
+        worker_data["ssh_options"] = tuple(worker_data["ssh_options"])
+    worker = LlamaCppRpcWorkerConfig(**worker_data)
+
+    topology_data["worker"] = worker
+    topology_data["devices"] = tuple(topology_data["devices"])
+    topology_data["tensor_split"] = tuple(topology_data["tensor_split"])
+    if "coordinator_environment" in topology_data:
+        topology_data["coordinator_environment"] = tuple(
+            tuple(pair) for pair in topology_data["coordinator_environment"]
+        )
+    return LlamaCppRpcConfig(**topology_data)
+
+
+def _attach_deepseek_rpc_topology(
+    configs: list[BatchConfig], rpc: LlamaCppRpcConfig,
+) -> list[BatchConfig]:
+    """Attach machine-local RPC values without mutating the registry config."""
+    return [
+        replace(
+            config,
+            server_recipe=replace(config.server_recipe, rpc=rpc),
+        )
+        if config.model == _DEEPSEEK_V4_MODEL else config
+        for config in configs
+    ]
+
+
+def _resolve_server_recipe_flags(
+    config: BatchConfig,
+    models_dir: Path,
+) -> list[str]:
+    """Resolve one recipe's runtime paths and literal llama-server flags."""
+    flags: list[str] = []
+    if config.server_recipe.draft_filename is not None:
+        flags.extend([
+            "--model-draft",
+            str(models_dir / config.server_recipe.draft_filename),
+        ])
+    flags.extend(config.server_recipe.extra_flags)
+    return flags
+
+
+def _print_rpc_recipe(
+    config: BatchConfig,
+    models_dir: Path,
+    budget_mode: BudgetMode,
+    manual_tokens: int | None,
+) -> None:
+    """Render the complete normalized launch recipe for an RPC batch config."""
+    rpc = config.server_recipe.rpc
+    assert rpc is not None
+    assert config.gguf_filename is not None
+    artifact = str(models_dir / config.gguf_filename)
+
+    sampling = get_sampling_defaults(config.model)
+    template_kwargs = sampling.get("chat_template_kwargs", {})
+    effort = (
+        template_kwargs.get("reasoning_effort")
+        if isinstance(template_kwargs, dict) else None
+    )
+
+    coordinator_command = [
+        "env",
+        *(f"{key}={value}" for key, value in rpc.coordinator_environment),
+        rpc.coordinator_executable,
+        "-m", artifact,
+        "-ngl", "999",
+        "--port", str(_eval_port()),
+        *render_rpc_coordinator_args(rpc),
+    ]
+    if config.mode == "native":
+        coordinator_command.append("--jinja")
+    coordinator_command.extend(_resolve_server_recipe_flags(config, models_dir))
+    if budget_mode == BudgetMode.MANUAL and manual_tokens is not None:
+        coordinator_command.extend(["-c", str(manual_tokens)])
+
+    print("  Managed RPC recipe:")
+    print(f"    model: {config.model}")
+    print(f"    reasoning effort (sampling registry): {effort}")
+    print(f"    worker command: {shlex.join(render_rpc_worker_command(rpc.worker))}")
+    print(f"    coordinator command: {shlex.join(coordinator_command)}")
+    print(f"    startup timeout: {rpc.startup_timeout:g}s")
+    print(f"    log directory: {rpc.log_directory or '<temporary>'}")
 
 
 # ── Anthropic pricing (USD per million tokens) ──────────────────
@@ -589,69 +754,7 @@ def _run_result_to_row(
     return row
 
 
-# ── llama-server flags ───────────────────────────────────────────
-
-# Extra flags per model for llama-server, keyed by config.model (the GGUF
-# stem for llamaserver configs).
-# Reasoning models (Qwen3): --reasoning-format auto for server-side <think>
-# tag parsing. Everything else: no extra flags needed.
-_SERVER_EXTRA_FLAGS: dict[str, list[str]] = {
-    "Qwen3-8B-Q4_K_M": ["--reasoning-format", "auto"],
-    "Qwen3-8B-Q8_0": ["--reasoning-format", "auto"],
-    "Qwen3-14B-Q4_K_M": ["--reasoning-format", "auto"],
-    "Qwen3.5-27B-Q4_K_M": ["--reasoning-format", "auto"],
-    "Qwen3.5-35B-A3B-Q4_K_M": ["--reasoning-format", "auto"],
-    "Qwen3.6-27B-Q4_K_M": ["--reasoning-format", "auto"],
-    "Qwen3.6-35B-A3B-UD-Q4_K_M": ["--reasoning-format", "auto"],
-    "Nemotron-3-Nano-30B-A3B-Q4_K_M": ["--reasoning-format", "auto"],
-    # 16GB tier reasoning models: LFM2.5 emits explicit CoT, Mellum2 Thinking
-    # emits <think> (qwen3-style) — both need server-side parsing. Mellum2
-    # Instruct is direct (no <think>), so it gets no extra flag.
-    "LFM2.5-8B-A1B-Q4_K_M": ["--reasoning-format", "auto"],
-    "Mellum2-12B-A2.5B-Thinking-Q4_K_M": ["--reasoning-format", "auto"],
-    # Gemma-4 large (rig-04): dense 31B + 26B-A4B MoE. --reasoning-format auto for
-    # <think> parsing; --ctx-checkpoints 1 bounds SWA checkpoint RAM (llama.cpp
-    # #21690); q8 KV + -fa for VRAM; --samplers orders temp/top_p/top_k (values
-    # come client-side from recommended_sampling → sampling_defaults). No
-    # --reasoning-budget (absent, as every other config here). No -c: context comes
-    # from --budget-mode (forge-full auto-fit).
-    "gemma-4-31B-it-Q4_K_M": [
-        "--reasoning-format", "auto",
-        "--ctx-checkpoints", "1", "--cache-type-k", "q8_0",
-        "--cache-type-v", "q8_0", "-fa", "1",
-        "--samplers", "temperature;top_p;top_k",
-    ],
-    "gemma-4-26B-A4B-it-UD-Q4_K_M": [
-        "--reasoning-format", "auto",
-        "--ctx-checkpoints", "1", "--cache-type-k", "q8_0",
-        "--cache-type-v", "q8_0", "-fa", "1",
-        "--samplers", "temperature;top_p;top_k",
-    ],
-    # 120B tier (rig-03, UMA/Vulkan). Shared portable recipe: --reasoning-format
-    # auto for <think> parsing, q8 KV + -fa for footprint, --no-prefill-assistant
-    # (trailing-assistant + thinking 400 guard). --no-mmap is rig-03/UMA-required
-    # (weights in shared RAM; kernel must not evict GGUF pages). The RADV env vars
-    # (AMD_VULKAN_ICD/RADV_PERFTEST) are set in the launch wrapper, not here — this
-    # dict is CLI-flags-only. No -c (context from --budget-mode forge-full). No
-    # --reasoning-budget. Reasoning level is client-side via sampling_defaults
-    # chat_template_kwargs (gpt-oss reasoning_effort=medium; nemotron low_effort).
-    "gpt-oss-120b-Q4_K_M": [
-        "--reasoning-format", "auto",
-        "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "-fa", "1",
-        "-ub", "2048", "-b", "2048",
-        "--no-prefill-assistant", "--no-mmap",
-    ],
-    "Qwen3.5-122B-A10B-Q4_K_M": [
-        "--reasoning-format", "auto",
-        "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "-fa", "1",
-        "--no-prefill-assistant", "--no-mmap",
-    ],
-    "NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q4_K_M": [
-        "--reasoning-format", "auto",
-        "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "-fa", "1",
-        "--no-prefill-assistant", "--no-mmap",
-    ],
-}
+# ── Model availability ──────────────────────────────────────────
 
 
 def _ollama_models() -> set[str]:
@@ -680,6 +783,9 @@ def _check_model_available(
             return f"no GGUF/llamafile filename on config for {config.model}"
         if not (models_dir / config.gguf_filename).exists():
             return f"file not found: {models_dir / config.gguf_filename}"
+        draft_filename = config.server_recipe.draft_filename
+        if draft_filename and not (models_dir / draft_filename).exists():
+            return f"draft file not found: {models_dir / draft_filename}"
     elif config.backend == "ollama":
         available = _ollama_models()
         if config.model not in available:
@@ -687,20 +793,12 @@ def _check_model_available(
     return None
 
 
-def _get_server_flags(model: str, mode: str) -> list[str]:
-    """Build llama-server CLI flags for a given model and mode."""
-    flags: list[str] = []
-    if mode == "native":
-        flags.append("--jinja")
-    flags.extend(_SERVER_EXTRA_FLAGS.get(model, []))
-    return flags
-
-
 # ── Run-level timeout ───────────────────────────────────────────
 
 # Wall-clock cap per scenario run. p99 in historical data is ~38s and the
 # longest legitimate 12GB-tier run is ~100s, so 300s is a safe hang guard.
-_RUN_TIMEOUT = 300
+_REQUEST_TIMEOUT = 300.0
+_RUN_TIMEOUT = 300.0
 
 
 async def _run_with_timeout(
@@ -708,6 +806,7 @@ async def _run_with_timeout(
     scenario: EvalScenario,
     eval_config: EvalConfig,
     ablation: AblationConfig | None,
+    run_timeout: float = _RUN_TIMEOUT,
 ) -> RunResult:
     """Run a scenario with a wall-clock cap.
 
@@ -718,7 +817,7 @@ async def _run_with_timeout(
     try:
         return await asyncio.wait_for(
             run_scenario(client, scenario, eval_config, ablation=ablation),
-            timeout=_RUN_TIMEOUT,
+            timeout=run_timeout,
         )
     except asyncio.TimeoutError:
         return RunResult(
@@ -726,7 +825,7 @@ async def _run_with_timeout(
             completed=False,
             iterations_used=0,
             error_type="Timeout",
-            error_message=f"Exceeded {_RUN_TIMEOUT}s",
+            error_message=f"Exceeded {run_timeout:g}s",
             elapsed_seconds=time.monotonic() - start,
         )
 
@@ -748,23 +847,20 @@ def _is_server_error(result: "RunResult") -> bool:
 
 async def _recover_server(
     server: "ServerManager",
-    config: BatchConfig,
-    gguf_path: str,
-    extra_flags: list[str] | None,
     crash_count: int,
     budget_mode: BudgetMode,
     manual_tokens: int | None,
-) -> bool:
+) -> int | None:
     """Attempt to restart the server after a crash.
 
-    Restarts through the prod ``start_with_budget`` path so the recovered
-    server is launched with the same budget (e.g. ``-c manual_tokens`` for
-    MANUAL mode) as the original.
+    Restarts the manager's last successful launch, preserving its resolved
+    topology and context arguments.
 
-    Returns True if recovery succeeded, False if circuit breaker tripped.
+    Returns the recovered budget, or ``None`` if recovery failed or the circuit
+    breaker tripped.
     """
     if crash_count > len(_RECOVERY_BACKOFFS):
-        return False
+        return None
 
     backoff = _RECOVERY_BACKOFFS[crash_count - 1]
     print(
@@ -781,29 +877,25 @@ async def _recover_server(
 
     await asyncio.sleep(backoff)
 
-    # Restart. Cache-equality identity: model string for ollama,
-    # GGUF path for non-Ollama (matches run_batch and setup_backend).
-    cache_identity = config.model if config.backend == "ollama" else gguf_path
     try:
-        await server.start_with_budget(
-            model=cache_identity,
-            gguf_path=gguf_path,
-            mode=config.mode,
-            budget_mode=budget_mode,
-            manual_tokens=manual_tokens,
-            extra_flags=extra_flags,
-        )
+        await server.restart()
+        resolved_budget = await server.resolve_budget(budget_mode, manual_tokens)
         print("  [!] Server restarted successfully.", flush=True)
-        return True
+        return resolved_budget
     except Exception as exc:
         print(f"  [!] Server restart failed: {exc}", flush=True)
-        return False
+        return None
 
 
 # ── Client factory ──────────────────────────────────────────────
 
 
-def _build_client(config: BatchConfig, models_dir: Path) -> Any:
+def _build_client(
+    config: BatchConfig,
+    models_dir: Path,
+    base_url: str,
+    request_timeout: float = _REQUEST_TIMEOUT,
+) -> Any:
     """Build the appropriate LLM client for a BatchConfig.
 
     For llamaserver/llamafile, ``gguf_path`` is constructed from
@@ -816,7 +908,8 @@ def _build_client(config: BatchConfig, models_dir: Path) -> Any:
         from forge.clients.ollama import OllamaClient
 
         return OllamaClient(
-            model=config.model, think=think_val,
+            model=config.model, base_url=base_url, think=think_val,
+            timeout=request_timeout,
             recommended_sampling=recommended_sampling,
         )
 
@@ -833,14 +926,16 @@ def _build_client(config: BatchConfig, models_dir: Path) -> Any:
             return LlamafileClient(
                 gguf_path=str(models_dir / config.gguf_filename),
                 mode=config.mode, think=think_val,
-                base_url=f"http://localhost:{_eval_port()}/v1",
+                base_url=base_url,
+                timeout=request_timeout,
                 recommended_sampling=False,
                 **config.sampling_override,
             )
         return LlamafileClient(
             gguf_path=str(models_dir / config.gguf_filename),
             mode=config.mode, think=think_val,
-            base_url=f"http://localhost:{_eval_port()}/v1",
+            base_url=base_url,
+            timeout=request_timeout,
             recommended_sampling=recommended_sampling,
         )
 
@@ -852,27 +947,9 @@ def _build_client(config: BatchConfig, models_dir: Path) -> Any:
             gguf_path=str(models_dir / config.gguf_filename),
             mode=config.mode,
             think=think_val,
-            base_url=f"http://localhost:{_eval_port()}/v1",
+            base_url=base_url,
+            timeout=request_timeout,
             recommended_sampling=recommended_sampling,
-        )
-
-    elif config.backend == "anthropic":
-        from forge.clients.anthropic import AnthropicClient
-
-        # Prompt caching on for sweeps: billing-only (identical model behavior
-        # and score/iteration metrics), caches the re-sent tool defs +
-        # system prompt. Static-only — see AnthropicClient._apply_static_cache.
-        #
-        # Adaptive extended thinking when think=True ("Claude with reasoning"
-        # baselines). Gated off for tool_choice="any" (forced tool choice is
-        # incompatible with thinking) and for models without adaptive support
-        # (Haiku, configured think=False). Request-only: no reasoning_replay
-        # folding — these are baseline rows, not part of the replay sweep.
-        thinking = {"type": "adaptive"} if (config.think and config.tool_choice != "any") else None
-        return AnthropicClient(
-            model=config.model, tool_choice=config.tool_choice,
-            prompt_caching=True, thinking=thinking,
-            max_tokens=16384 if thinking else 4096,
         )
 
     else:
@@ -913,10 +990,12 @@ async def run_batch(
     ablation: AblationConfig | None = None,
     reasoning_replay: ReasoningReplay = DEFAULT_REASONING_REPLAY,
     generation: int = 0,
+    request_timeout: float = _REQUEST_TIMEOUT,
+    run_timeout: float = _RUN_TIMEOUT,
 ) -> None:
     """Run all configs × scenarios, appending each result to JSONL.
 
-    Budget resolution uses the prod ServerManager path. Compaction
+    Budget resolution uses the public ``setup_backend()`` path. Compaction
     scenarios (compaction_stress, phase2_compaction) always override
     with their own hardcoded budget.
     """
@@ -924,6 +1003,24 @@ async def run_batch(
     from tests.eval.eval_runner import _COMPACTION_SCENARIOS
 
     generation = _validate_generation(generation)
+    supported_backends = {"ollama", "llamaserver", "llamafile"}
+    unsupported_backends = sorted({
+        config.backend for config in configs
+        if config.backend not in supported_backends
+    })
+    if unsupported_backends:
+        raise ValueError(
+            "batch_eval supports only managed backends "
+            f"{sorted(supported_backends)}; unsupported: {unsupported_backends}"
+        )
+    if any(
+        config.model == _DEEPSEEK_V4_MODEL
+        and config.server_recipe.rpc is None
+        for config in configs
+    ):
+        raise ValueError(
+            "DeepSeek V4 RPC batch config requires an attached RPC topology"
+        )
 
     if scenario_names:
         name_set = set(scenario_names)
@@ -953,8 +1050,7 @@ async def run_batch(
         tc_label_pre = config.tool_choice or "auto"
         for scenario in scenarios:
             skip_compaction = (
-                config.backend == "anthropic"
-                or (ablation is not None and not ablation.compaction_enabled)
+                ablation is not None and not ablation.compaction_enabled
             )
             if scenario.name in _COMPACTION_SCENARIOS and skip_compaction:
                 continue
@@ -972,198 +1068,104 @@ async def run_batch(
     total_ran = 0
     total_failed_connect = 0
     batch_start = time.monotonic()
-    server = ServerManager(backend="ollama", port=_eval_port(), models_dir=models_dir)
-    prev_backend: str | None = None
-    prev_server: ServerManager | None = None
+    for cfg_idx, config in enumerate(configs, 1):
+        tc_label = config.tool_choice or "auto"
+        config_label = f"{config.model} ({config.backend}/{config.mode})"
+        if config.tool_choice:
+            config_label += f" [tool_choice={config.tool_choice}]"
+        print(
+            f"\n{'='*70}\n"
+            f"[{cfg_idx}/{total_configs}] {config_label}\n"
+            f"{'='*70}",
+            flush=True,
+        )
+        if (
+            config.model == _DEEPSEEK_V4_MODEL
+            and config.server_recipe.rpc is not None
+        ):
+            _print_rpc_recipe(config, models_dir, budget_mode, manual_tokens)
 
-    try:
-        for cfg_idx, config in enumerate(configs, 1):
-            tc_label = config.tool_choice or "auto"
-            config_label = f"{config.model} ({config.backend}/{config.mode})"
-            if config.tool_choice:
-                config_label += f" [tool_choice={config.tool_choice}]"
-            print(
-                f"\n{'='*70}\n"
-                f"[{cfg_idx}/{total_configs}] {config_label}\n"
-                f"{'='*70}",
-                flush=True,
-            )
-
-            # ── Dry run ───────────────────────────────────────
-            if dry_run:
-                for scenario in scenarios:
-                    skip_compaction = (
-                        config.backend == "anthropic"
-                        or (ablation is not None and not ablation.compaction_enabled)
-                    )
-                    if scenario.name in _COMPACTION_SCENARIOS and skip_compaction:
-                        print(f"  {scenario.name}: SKIP (compaction N/A)")
-                        continue
-                    key = _run_key(
-                        config.model, config.backend, config.mode,
-                        ablation_name, tc_label, reasoning_replay,
-                        config.reasoning_level, scenario.name,
-                    )
-                    existing = recorded_counts.get(key, 0)
-                    remaining = max(0, runs_per_scenario - existing)
-                    status = "SKIP" if remaining == 0 else f"RUN {remaining}"
-                    print(f"  {scenario.name}: {existing}/{runs_per_scenario} done -> {status}")
-                continue
-
-            # ── Model availability check ────────────────────
-            skip_reason = _check_model_available(config, models_dir)
-            if skip_reason:
-                # Stop Ollama before skipping so VRAM is clear for later configs
-                if prev_backend == "ollama" and config.backend != "ollama":
-                    if prev_server is not None:
-                        await prev_server.stop()
-                    prev_backend = None
-                print(f"  SKIP ({skip_reason})", flush=True)
-                total_skipped += total_scenarios
-                continue
-
-            # ── Anthropic cloud API path ─────────────────────
-            # No server management, no GGUF, no VRAM budget.
-            if config.backend == "anthropic":
-                client = _build_client(config, models_dir)
-
-                for sc_idx, scenario in enumerate(scenarios, 1):
-                    if scenario.name in _COMPACTION_SCENARIOS:
-                        total_skipped += 1
-                        continue
-
-                    key = _run_key(
-                        config.model, config.backend, config.mode,
-                        ablation_name, tc_label, reasoning_replay,
-                        config.reasoning_level, scenario.name,
-                    )
-                    existing = recorded_counts.get(key, 0)
-                    remaining = max(0, runs_per_scenario - existing)
-
-                    if remaining == 0:
-                        total_skipped += 1
-                        continue
-
-                    scenario_budget = scenario.budget_tokens
-
-                    eval_config = EvalConfig(
-                        runs_per_scenario=1,
-                        stream=True,
-                        keep_message_history=True,
-                        verbose=verbose,
-                        budget_override=scenario_budget,
-                        reasoning_replay=reasoning_replay,
-                    )
-
-                    eta = _format_eta(total_ran, total_expected, batch_start)
-                    print(
-                        f"\n  [{sc_idx}/{total_scenarios}] {scenario.name} "
-                        f"- {existing} done, running {remaining} more{eta}",
-                        flush=True,
-                    )
-
-                    for run_idx in range(existing, existing + remaining):
-                        result = await _run_with_timeout(client, scenario, eval_config, ablation)
-                        total_ran += 1
-                        status = "OK" if result.completed else f"FAIL ({result.error_type})"
-                        print(
-                            f"    run {run_idx+1}/{runs_per_scenario}: {status} "
-                            f"- {result.iterations_used} iters, "
-                            f"{result.elapsed_seconds:.1f}s",
-                            flush=True,
-                        )
-
-                        row = _run_result_to_row(
-                            result, config, scenario, run_idx + 1,
-                            generation=generation,
-                            budget_tokens=scenario_budget,
-                            ablation_name=ablation_name,
-                            reasoning_replay=reasoning_replay,
-                            outcome_dialect=outcome_dialect,
-                        )
-                        _append_jsonl_row(output_path, row)
-
-                        recorded_counts[key] = recorded_counts.get(key, 0) + 1
-                continue
-
-            # ── Check if any scenarios need runs ─────────────
-            has_work = False
+        # ── Dry run ───────────────────────────────────────
+        if dry_run:
             for scenario in scenarios:
                 skip_compaction = (
                     ablation is not None and not ablation.compaction_enabled
                 )
                 if scenario.name in _COMPACTION_SCENARIOS and skip_compaction:
+                    print(f"  {scenario.name}: SKIP (compaction N/A)")
                     continue
-                key_check = _run_key(
+                key = _run_key(
                     config.model, config.backend, config.mode,
                     ablation_name, tc_label, reasoning_replay,
                     config.reasoning_level, scenario.name,
                 )
-                if recorded_counts.get(key_check, 0) < runs_per_scenario:
-                    has_work = True
-                    break
-            if not has_work:
-                print("  SKIP (all requested attempts recorded)", flush=True)
-                total_skipped += total_scenarios
+                existing = recorded_counts.get(key, 0)
+                remaining = max(0, runs_per_scenario - existing)
+                status = "SKIP" if remaining == 0 else f"RUN {remaining}"
+                print(f"  {scenario.name}: {existing}/{runs_per_scenario} done -> {status}")
+            continue
+
+        # ── Model availability check ────────────────────
+        skip_reason = _check_model_available(config, models_dir)
+        if skip_reason:
+            print(f"  SKIP ({skip_reason})", flush=True)
+            total_skipped += total_scenarios
+            continue
+
+        # ── Check if any scenarios need runs ─────────────
+        has_work = False
+        for scenario in scenarios:
+            skip_compaction = (
+                ablation is not None and not ablation.compaction_enabled
+            )
+            if scenario.name in _COMPACTION_SCENARIOS and skip_compaction:
                 continue
+            key_check = _run_key(
+                config.model, config.backend, config.mode,
+                ablation_name, tc_label, reasoning_replay,
+                config.reasoning_level, scenario.name,
+            )
+            if recorded_counts.get(key_check, 0) < runs_per_scenario:
+                has_work = True
+                break
+        if not has_work:
+            print("  SKIP (all requested attempts recorded)", flush=True)
+            total_skipped += total_scenarios
+            continue
 
-            # ── Local backend path (server-managed) ──────────
+        # Resolve GGUF/llamafile path for non-Ollama backends
+        gguf_path: str | None = None
+        if config.backend in ("llamaserver", "llamafile"):
+            assert config.gguf_filename, f"missing gguf_filename: {config.model}"
+            gguf_path = str(models_dir / config.gguf_filename)
 
-            # Clean VRAM unload when switching away from Ollama
-            if prev_backend == "ollama" and config.backend != "ollama":
-                if prev_server is not None:
-                    await prev_server.stop()
+        server_flags = _resolve_server_recipe_flags(config, models_dir)
+        try:
+            server, setup_context = await setup_backend(
+                backend=config.backend,
+                model=config.model if config.backend == "ollama" else None,
+                gguf_path=gguf_path,
+                mode=config.mode,
+                port=_eval_port(),
+                budget_mode=budget_mode,
+                manual_tokens=manual_tokens,
+                extra_flags=server_flags or None,
+                rpc=config.server_recipe.rpc,
+            )
+        except RuntimeError:
+            print(f"  SKIP (server failed to start)", flush=True)
+            total_skipped += total_scenarios
+            continue
 
-            # Create new ServerManager if backend changed
-            if config.backend != prev_backend:
-                if prev_server is not None and prev_backend != "ollama":
-                    await prev_server.stop()
-                server = ServerManager(
-                    backend=config.backend, port=_eval_port(), models_dir=models_dir
-                )
-
-            # Resolve GGUF/llamafile path for non-Ollama backends
-            gguf_path = ""
-            if config.backend in ("llamaserver", "llamafile"):
-                assert config.gguf_filename, f"missing gguf_filename: {config.model}"
-                gguf_path = str(models_dir / config.gguf_filename)
-
-            # Start server and get extra flags. For non-Ollama backends pass
-            # the GGUF path as the cache-equality key (matches setup_backend
-            # convention from server.py); for Ollama, pass the model string.
-            extra_flags = _get_server_flags(config.model, config.mode)
-            cache_identity = config.model if config.backend == "ollama" else gguf_path
-            try:
-                # Prod path: launches with the budget-appropriate context
-                # (e.g. -c manual_tokens for MANUAL) and returns the resolved
-                # budget, instead of starting raw and reading back full ctx.
-                resolved_budget = await server.start_with_budget(
-                    model=cache_identity,
-                    gguf_path=gguf_path,
-                    mode=config.mode,
-                    budget_mode=budget_mode,
-                    manual_tokens=manual_tokens,
-                    extra_flags=extra_flags if extra_flags else None,
-                )
-            except RuntimeError:
-                # Startup timeout — attempt recovery
-                recovered = await _recover_server(
-                    server, config, gguf_path,
-                    extra_flags if extra_flags else None,
-                    crash_count=1,
-                    budget_mode=budget_mode, manual_tokens=manual_tokens,
-                )
-                if not recovered:
-                    print(f"  SKIP (server failed to start)", flush=True)
-                    total_skipped += total_scenarios
-                    continue
-                resolved_budget = await server.resolve_budget(budget_mode, manual_tokens)
-
-            prev_backend = config.backend
-            prev_server = server
-
-            # Build client
-            client = _build_client(config, models_dir)
+        try:
+            resolved_budget = setup_context.budget_tokens
+            # Build one client for this isolated managed configuration.
+            client = _build_client(
+                config,
+                models_dir,
+                server.client_base_url,
+                request_timeout,
+            )
             if hasattr(client, "set_num_ctx"):
                 client.set_num_ctx(resolved_budget)
 
@@ -1218,7 +1220,9 @@ async def run_batch(
                 )
 
                 for run_idx in range(existing, existing + remaining):
-                    result = await _run_with_timeout(client, scenario, eval_config, ablation)
+                    result = await _run_with_timeout(
+                        client, scenario, eval_config, ablation, run_timeout
+                    )
                     total_ran += 1
 
                     # Server crash recovery
@@ -1229,13 +1233,10 @@ async def run_batch(
                             f"CRASH ({result.error_message.split(':')[0]})",
                             flush=True,
                         )
-                        recovered = await _recover_server(
-                            server, config, gguf_path,
-                            extra_flags if extra_flags else None,
-                            crash_count,
-                            budget_mode=budget_mode, manual_tokens=manual_tokens,
+                        recovered_budget = await _recover_server(
+                            server, crash_count, budget_mode, manual_tokens
                         )
-                        if not recovered:
+                        if recovered_budget is None:
                             print(
                                 f"\n  [!] Circuit breaker: {crash_count} crashes "
                                 f"for {config_label}. Skipping remaining scenarios.",
@@ -1245,12 +1246,19 @@ async def run_batch(
                             break
 
                         # Rebuild client and retry the failed run
-                        client = _build_client(config, models_dir)
-                        resolved_budget = await server.resolve_budget(budget_mode, manual_tokens)
+                        client = _build_client(
+                            config,
+                            models_dir,
+                            server.client_base_url,
+                            request_timeout,
+                        )
+                        resolved_budget = recovered_budget
                         if hasattr(client, "set_num_ctx"):
                             client.set_num_ctx(scenario_budget)
 
-                        result = await _run_with_timeout(client, scenario, eval_config, ablation)
+                        result = await _run_with_timeout(
+                            client, scenario, eval_config, ablation, run_timeout
+                        )
                         total_ran += 1
 
                     status = "OK" if result.completed else f"FAIL ({result.error_type})"
@@ -1273,12 +1281,8 @@ async def run_batch(
 
                     # Update in-memory count for resume correctness
                     recorded_counts[key] = recorded_counts.get(key, 0) + 1
-
-            # Free VRAM after finishing all scenarios for this Ollama config
-            if config.backend == "ollama":
-                await server.stop()
-    finally:
-        await server.stop()
+        finally:
+            await server.stop()
 
     elapsed = time.monotonic() - batch_start
     print(
@@ -1318,6 +1322,12 @@ async def main() -> None:
         help="Which config set to run",
     )
     parser.add_argument(
+        "--rpc-topology",
+        type=str,
+        default=None,
+        help="JSON topology file required by --config deepseek-v4-rpc.",
+    )
+    parser.add_argument(
         "--scenario", nargs="*",
         help="Run specific scenarios by name (e.g. --scenario basic_2step sequential_reasoning)",
     )
@@ -1332,6 +1342,18 @@ async def main() -> None:
         type=int,
         default=None,
         help="Exact token budget (requires --budget-mode manual).",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=_REQUEST_TIMEOUT,
+        help="Per-request client timeout in seconds (default: 300).",
+    )
+    parser.add_argument(
+        "--run-timeout",
+        type=float,
+        default=_RUN_TIMEOUT,
+        help="Whole scenario-run timeout in seconds (default: 300).",
     )
     parser.add_argument(
         "--tags", nargs="*",
@@ -1376,6 +1398,16 @@ async def main() -> None:
         configs = [c for c in configs if args.model in c.model]
         if not configs:
             parser.error(f"No configs match --model '{args.model}' in set '{args.config}'")
+    if args.config == "deepseek-v4-rpc":
+        if args.rpc_topology is None:
+            parser.error("--config deepseek-v4-rpc requires --rpc-topology")
+        try:
+            rpc_topology = _load_rpc_topology(Path(args.rpc_topology))
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            parser.error(f"cannot load --rpc-topology: {exc}")
+        configs = _attach_deepseek_rpc_topology(configs, rpc_topology)
+    elif args.rpc_topology is not None:
+        parser.error("--rpc-topology is only valid with --config deepseek-v4-rpc")
     output_path = Path(args.output) if args.output else Path("eval_results.jsonl")
 
     if args.scenario:
@@ -1400,6 +1432,8 @@ async def main() -> None:
     print(f"  Runs/scenario: {args.runs}")
     print(f"  Output:        {output_path}")
     print(f"  Models dir:    {args.models_dir}")
+    if args.rpc_topology:
+        print(f"  RPC topology:  {args.rpc_topology}")
     print(f"  Total max runs: {len(configs) * scenario_count * args.runs}")
 
     models_dir = Path(args.models_dir)
@@ -1418,6 +1452,8 @@ async def main() -> None:
         ablation=ablation,
         reasoning_replay=args.reasoning_replay,
         generation=args.generation,
+        request_timeout=args.request_timeout,
+        run_timeout=args.run_timeout,
     )
 
 
