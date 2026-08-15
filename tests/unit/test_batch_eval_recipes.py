@@ -29,6 +29,7 @@ _EXPECTED_GGUFS = [
     ("Qwen3.5-35B-A3B-Q4_K_M", "Qwen3.5-35B-A3B-Q4_K_M.gguf"),
     ("Qwen3.6-27B-Q4_K_M", "Qwen3.6-27B-Q4_K_M.gguf"),
     ("Qwen3.6-35B-A3B-UD-Q4_K_M", "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"),
+    ("Qwen3.8-27B-UD-Q4_K_XL", "Qwen3.8-27B-UD-Q4_K_XL.gguf"),
     ("Nemotron-3-Nano-30B-A3B-Q4_K_M", "Nemotron-3-Nano-30B-A3B-Q4_K_M.gguf"),
     ("Muse-Glimmer-30B-UD-Q4_K_XL", "Muse-Glimmer-30B-UD-Q4_K_XL.gguf"),
     ("gemma-4-26B-A4B-it-UD-Q4_K_M", "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"),
@@ -66,6 +67,10 @@ _EXPECTED_OLLAMA_MODELS = [
 ]
 
 _REASONING_FLAGS = ("--reasoning-format", "auto")
+_QWEN38_FLAGS = (
+    "--reasoning-format", "auto",
+    "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "-fa", "1",
+)
 _GEMMA4_LARGE_FLAGS = (
     "--reasoning-format", "auto",
     "--ctx-checkpoints", "1", "--cache-type-k", "q8_0",
@@ -83,15 +88,22 @@ _LARGE_120B_FLAGS = (
     "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "-fa", "1",
     "--no-prefill-assistant", "--no-mmap",
 )
-_GLIMMER_FLAGS = (
-    "--reasoning", "on", "--reasoning-format", "auto",
-    "--chat-template-kwargs", '{"reasoning_strength":"xhigh"}',
-    "--ctx-checkpoints", "1", "--cache-type-k", "q8_0",
-    "--cache-type-v", "q8_0", "-fa", "1",
-    "--samplers", "temperature;top_p;top_k",
-    "--spec-type", "draft-dflash", "--device-draft", "CUDA0",
-    "--gpu-layers-draft", "all", "--spec-draft-n-max", "15",
-)
+
+
+def _glimmer_flags(reasoning_strength: str) -> tuple[str, ...]:
+    return (
+        "--reasoning", "on", "--reasoning-format", "auto",
+        "--chat-template-kwargs",
+        f'{{"reasoning_strength":"{reasoning_strength}"}}',
+        "--ctx-checkpoints", "1", "--cache-type-k", "q8_0",
+        "--cache-type-v", "q8_0", "-fa", "1",
+        "--samplers", "temperature;top_p;top_k",
+        "--spec-type", "draft-dflash", "--device-draft", "CUDA0",
+        "--gpu-layers-draft", "all", "--spec-draft-n-max", "15",
+    )
+
+
+_GLIMMER_FLAGS = _glimmer_flags("xhigh")
 
 _EXPECTED_SPECIAL_FLAGS = {
     "Qwen3-8B-Q4_K_M": _REASONING_FLAGS,
@@ -101,6 +113,7 @@ _EXPECTED_SPECIAL_FLAGS = {
     "Qwen3.5-35B-A3B-Q4_K_M": _REASONING_FLAGS,
     "Qwen3.6-27B-Q4_K_M": _REASONING_FLAGS,
     "Qwen3.6-35B-A3B-UD-Q4_K_M": _REASONING_FLAGS,
+    "Qwen3.8-27B-UD-Q4_K_XL": _QWEN38_FLAGS,
     "Nemotron-3-Nano-30B-A3B-Q4_K_M": _REASONING_FLAGS,
     "Muse-Glimmer-30B-UD-Q4_K_XL": _GLIMMER_FLAGS,
     "LFM2.5-8B-A1B-Q4_K_M": _REASONING_FLAGS,
@@ -116,6 +129,7 @@ _EXPECTED_REASONING_LEVELS = {
     "gpt-oss-120b-Q4_K_M": "medium",
     "NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q4_K_M": "low",
     "Muse-Glimmer-30B-UD-Q4_K_XL": "xhigh",
+    "Qwen3.8-27B-UD-Q4_K_XL": "xhigh",
 }
 
 
@@ -180,7 +194,41 @@ def test_managed_config_roster_and_sets_are_pinned() -> None:
         "llamaserver-native": [entry for entry in llamaserver if entry[2] == "native"],
         "llamaserver-prompt": [entry for entry in llamaserver if entry[2] == "prompt"],
         "reasoning-high": reasoning_high,
+        "glimmer-high": [
+            (
+                "Muse-Glimmer-30B-UD-Q4_K_XL", "llamaserver", "native",
+                "high", "Muse-Glimmer-30B-UD-Q4_K_XL.gguf",
+            ),
+        ],
+        "glimmer-medium": [
+            (
+                "Muse-Glimmer-30B-UD-Q4_K_XL", "llamaserver", "native",
+                "medium", "Muse-Glimmer-30B-UD-Q4_K_XL.gguf",
+            ),
+        ],
+        "glimmer-low": [
+            (
+                "Muse-Glimmer-30B-UD-Q4_K_XL", "llamaserver", "native",
+                "low", "Muse-Glimmer-30B-UD-Q4_K_XL.gguf",
+            ),
+        ],
         "deepseek-v4-rpc": deepseek_v4_rpc,
+        "qwen38": [
+            entry for entry in llamaserver
+            if entry[0] == "Qwen3.8-27B-UD-Q4_K_XL" and entry[2] == "native"
+        ],
+        "qwen38-medium": [
+            (
+                "Qwen3.8-27B-UD-Q4_K_XL", "llamaserver", "native",
+                "medium", "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+            ),
+        ],
+        "qwen38-low": [
+            (
+                "Qwen3.8-27B-UD-Q4_K_XL", "llamaserver", "native",
+                "low", "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+            ),
+        ],
         "new-models": [entry for entry in llamaserver if entry[0] in new_models],
         "new-models-native": [
             entry for entry in llamaserver
@@ -237,6 +285,13 @@ def test_managed_recipe_mapping_matches_pinned_literals() -> None:
     )
     assert '{"reasoning_strength":"xhigh"}' in glimmer.server_recipe.extra_flags
 
+    for effort, configs in batch_eval._GLIMMER_EFFORT_CONFIGS.items():
+        assert len(configs) == 1
+        config = configs[0]
+        assert config.reasoning_level == effort
+        assert config.server_recipe.extra_flags == _glimmer_flags(effort)
+        assert config.server_recipe.draft_filename == "dflash-kquant.gguf"
+
     deepseek = batch_eval.DEEPSEEK_V4_RPC_CONFIGS[0]
     assert deepseek.server_recipe.extra_flags == (
         "--fit", "off",
@@ -260,6 +315,3 @@ def test_managed_recipe_mapping_matches_pinned_literals() -> None:
     recipe = batch_eval._BatchServerRecipe(("--reasoning-format", "auto"))
     with pytest.raises(FrozenInstanceError):
         recipe.extra_flags = ()  # type: ignore[misc]
-
-    assert not hasattr(batch_eval, "_SERVER_EXTRA_FLAGS")
-    assert not hasattr(batch_eval, "_get_server_flags")

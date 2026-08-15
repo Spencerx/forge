@@ -67,6 +67,10 @@ class _BatchServerRecipe:
 
 _DEFAULT_SERVER_RECIPE = _BatchServerRecipe()
 _REASONING_SERVER_RECIPE = _BatchServerRecipe(("--reasoning-format", "auto"))
+_QWEN38_SERVER_RECIPE = _BatchServerRecipe((
+    "--reasoning-format", "auto",
+    "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "-fa", "1",
+))
 _GEMMA4_LARGE_SERVER_RECIPE = _BatchServerRecipe((
     "--reasoning-format", "auto",
     "--ctx-checkpoints", "1", "--cache-type-k", "q8_0",
@@ -84,18 +88,27 @@ _LARGE_120B_SERVER_RECIPE = _BatchServerRecipe((
     "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "-fa", "1",
     "--no-prefill-assistant", "--no-mmap",
 ))
-_GLIMMER_SERVER_RECIPE = _BatchServerRecipe(
-    extra_flags=(
-        "--reasoning", "on", "--reasoning-format", "auto",
-        "--chat-template-kwargs", '{"reasoning_strength":"xhigh"}',
-        "--ctx-checkpoints", "1", "--cache-type-k", "q8_0",
-        "--cache-type-v", "q8_0", "-fa", "1",
-        "--samplers", "temperature;top_p;top_k",
-        "--spec-type", "draft-dflash", "--device-draft", "CUDA0",
-        "--gpu-layers-draft", "all", "--spec-draft-n-max", "15",
-    ),
-    draft_filename="dflash-kquant.gguf",
-)
+
+
+def _glimmer_server_recipe(reasoning_strength: str) -> _BatchServerRecipe:
+    return _BatchServerRecipe(
+        extra_flags=(
+            "--reasoning", "on", "--reasoning-format", "auto",
+            "--chat-template-kwargs",
+            json.dumps(
+                {"reasoning_strength": reasoning_strength}, separators=(",", ":")
+            ),
+            "--ctx-checkpoints", "1", "--cache-type-k", "q8_0",
+            "--cache-type-v", "q8_0", "-fa", "1",
+            "--samplers", "temperature;top_p;top_k",
+            "--spec-type", "draft-dflash", "--device-draft", "CUDA0",
+            "--gpu-layers-draft", "all", "--spec-draft-n-max", "15",
+        ),
+        draft_filename="dflash-kquant.gguf",
+    )
+
+
+_GLIMMER_SERVER_RECIPE = _glimmer_server_recipe("xhigh")
 _DEEPSEEK_V4_RPC_SERVER_RECIPE = _BatchServerRecipe((
     "--fit", "off",
     "-b", "2048", "-ub", "128",
@@ -120,6 +133,7 @@ _EFFECTIVE_REASONING_LEVELS: dict[str, str] = {
     "gpt-oss-120b-Q4_K_M": "medium",
     "NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q4_K_M": "low",
     "Muse-Glimmer-30B-UD-Q4_K_XL": "xhigh",
+    "Qwen3.8-27B-UD-Q4_K_XL": "xhigh",
 }
 
 
@@ -146,6 +160,7 @@ _GGUF_FILES: list[tuple[str, _BatchServerRecipe]] = [
     ("Qwen3.5-35B-A3B-Q4_K_M.gguf", _REASONING_SERVER_RECIPE),
     ("Qwen3.6-27B-Q4_K_M.gguf", _REASONING_SERVER_RECIPE),
     ("Qwen3.6-35B-A3B-UD-Q4_K_M.gguf", _REASONING_SERVER_RECIPE),
+    ("Qwen3.8-27B-UD-Q4_K_XL.gguf", _QWEN38_SERVER_RECIPE),
     ("Nemotron-3-Nano-30B-A3B-Q4_K_M.gguf", _REASONING_SERVER_RECIPE),
     ("Muse-Glimmer-30B-UD-Q4_K_XL.gguf", _GLIMMER_SERVER_RECIPE),
     # Gemma-4 large (rig-04, az/eval-large): 26B-A4B MoE + 31B dense. Native FC;
@@ -289,6 +304,25 @@ NEW_MODEL_CONFIGS: list[BatchConfig] = [
     c for c in LLAMASERVER_CONFIGS if c.model in _NEW_MODEL_STEMS
 ]
 
+QWEN38_CONFIGS: list[BatchConfig] = [
+    c for c in LLAMASERVER_CONFIGS
+    if c.model == "Qwen3.8-27B-UD-Q4_K_XL" and c.mode == "native"
+]
+
+_QWEN38_EFFORT_CONFIGS: dict[str, list[BatchConfig]] = {
+    effort: [
+        replace(
+            QWEN38_CONFIGS[0],
+            reasoning_level=effort,
+            sampling_override={
+                **get_sampling_defaults("Qwen3.8-27B-UD-Q4_K_XL"),
+                "chat_template_kwargs": {"reasoning_effort": effort},
+            },
+        )
+    ]
+    for effort in ("medium", "low")
+}
+
 # Reasoning-effort axis (rig-03): gpt-oss@high + nemotron@high as PARALLEL
 # configs to the medium/low-effort baselines. Same GGUF + native FC, but
 # recommended sampling is bypassed (sampling_override) so chat_template_kwargs
@@ -324,6 +358,21 @@ _REASONING_HIGH_CONFIGS: list[BatchConfig] = [
     ),
 ]
 
+_GLIMMER_EFFORT_CONFIGS: dict[str, list[BatchConfig]] = {
+    effort: [
+        BatchConfig(
+            model="Muse-Glimmer-30B-UD-Q4_K_XL",
+            backend="llamaserver",
+            mode="native",
+            think=None,
+            gguf_filename="Muse-Glimmer-30B-UD-Q4_K_XL.gguf",
+            server_recipe=_glimmer_server_recipe(effort),
+            reasoning_level=effort,
+        )
+    ]
+    for effort in ("high", "medium", "low")
+}
+
 # Explicit large-model campaign. Machine-local RPC values are attached from
 # --rpc-topology at invocation time; reasoning effort comes only from the
 # sampling-registry row for this model.
@@ -348,7 +397,13 @@ CONFIG_SETS: dict[str, list[BatchConfig]] = {
     "llamaserver-native": [c for c in LLAMASERVER_CONFIGS if c.mode == "native"],
     "llamaserver-prompt": [c for c in LLAMASERVER_CONFIGS if c.mode == "prompt"],
     "reasoning-high": _REASONING_HIGH_CONFIGS,
+    "glimmer-high": _GLIMMER_EFFORT_CONFIGS["high"],
+    "glimmer-medium": _GLIMMER_EFFORT_CONFIGS["medium"],
+    "glimmer-low": _GLIMMER_EFFORT_CONFIGS["low"],
     "deepseek-v4-rpc": DEEPSEEK_V4_RPC_CONFIGS,
+    "qwen38": QWEN38_CONFIGS,
+    "qwen38-medium": _QWEN38_EFFORT_CONFIGS["medium"],
+    "qwen38-low": _QWEN38_EFFORT_CONFIGS["low"],
     "new-models": NEW_MODEL_CONFIGS,
     "new-models-native": [c for c in NEW_MODEL_CONFIGS if c.mode == "native"],
     "new-models-prompt": [c for c in NEW_MODEL_CONFIGS if c.mode == "prompt"],
